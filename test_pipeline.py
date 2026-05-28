@@ -22,7 +22,7 @@ You must strictly perform TWO completely separate tasks simultaneously:
 2. The System Evaluator: Act as the game's background engine, secretly evaluating the user's English and generating feedback for a UI caption box.
 
 [Character Persona]
-- Name: Alex (CH_01_M)
+- Name: Liam (CH_01_M)
 - Personality: Friendly, warm, slightly teasing
 - Current Situation: At a cafe (SC_01)
 - Current Affinity: 45/100
@@ -39,6 +39,39 @@ You must strictly perform TWO completely separate tasks simultaneously:
 You MUST respond STRICTLY in JSON format. Do NOT wrap the JSON in Markdown formatting.
 """
 
+# ==========================================
+# ★ 2. [추가된 부분] 캐릭터별 SSML 조립 공장 ★
+# ==========================================
+def make_ssml(character_id, text_content):
+    """
+    캐릭터 ID에 맞춰서 목소리, 속도, 높낮이가 세팅된 SSML 문자열을 뱉어내는 함수
+    """
+    if character_id == "CH_01_M":  # 리암 (영국 어른 남자)
+        voice_name = "en-GB-RyanNeural"
+        rate = "-10%"
+        pitch = "-5%"
+    elif character_id == "CH_02_F":  # 클로이 (통통 튀는 요정)
+        voice_name = "en-US-AriaNeural"
+        rate = "+10%"
+        pitch = "+5%"
+    else:  # 기본값
+        voice_name = "en-US-ChristopherNeural"
+        rate = "0%"
+        pitch = "0%"
+
+    # SSML 포맷 조립 (f-string으로 변수 주입)
+    ssml_string = f"""
+    <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">
+        <voice name="{voice_name}">
+            <prosody rate="{rate}" pitch="{pitch}">
+                {text_content}
+            </prosody>
+        </voice>
+    </speak>
+    """
+    return ssml_string
+
+
 def run_ai_pipeline(user_text):
     print("🚀 1. Azure OpenAI로 캐릭터 답변 및 평가 생성 중...")
     
@@ -49,7 +82,7 @@ def run_ai_pipeline(user_text):
         api_version="2024-02-15-preview" 
     )
 
-    # GPT 호출 (우리가 짠 JSON 형태로 무조건 달라고 강제!)
+    # GPT 호출
     response = client.chat.completions.create(
         model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
         response_format={ "type": "json_object" }, 
@@ -57,7 +90,7 @@ def run_ai_pipeline(user_text):
             {"role": "system", "content": SYSTEM_PROMPT},
             # 이전 대화 (history) 모의 주입
             {"role": "user", "content": "Hello!"},
-            {"role": "assistant", "content": "Hey, what's up? Warm day, isn't it?"},
+            {"role": "assistant", "content": "Morning, love! Warm day, isn't it?"},
             # 이번 턴 유저 입력
             {"role": "user", "content": user_text}
         ]
@@ -69,21 +102,27 @@ def run_ai_pipeline(user_text):
     print(f"✅ 대사 생성 완료: {character_reply}\n")
 
 
-    print("🚀 2. Azure Speech로 캐릭터 목소리(TTS) 생성 중...")
+    print("🚀 2. Azure Speech로 캐릭터 목소리(TTS) 생성 중... (★SSML 튜닝 적용★)")
     
     speech_config = speechsdk.SpeechConfig(
         subscription=os.getenv("AZURE_SPEECH_KEY"), 
         region=os.getenv("AZURE_SPEECH_REGION")
     )
-    # 남자 캐릭터 목소리 설정 (가이)
-    speech_config.speech_synthesis_voice_name = "en-US-GuyNeural"
+    
+    # [수정된 부분 1] 기존의 단일 목소리 지정 코드는 삭제합니다. SSML 안에 목소리 정보가 들어가기 때문!
+    # speech_config.speech_synthesis_voice_name = "en-US-GuyNeural" 
     
     # 임시 파일명 생성
     temp_filename = f"reply_{uuid.uuid4().hex[:8]}.mp3"
     audio_config = speechsdk.audio.AudioOutputConfig(filename=temp_filename)
     
     synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
-    tts_result = synthesizer.speak_text_async(character_reply).get()
+    
+    # [수정된 부분 2] ★ GPT가 만들어낸 대사를 리암(CH_01_M)의 SSML로 변환
+    ssml_string = make_ssml("CH_01_M", character_reply)
+    
+    # [수정된 부분 3] ★ 기존 speak_text_async 대신 speak_ssml_async 사용!
+    tts_result = synthesizer.speak_ssml_async(ssml_string).get()
 
     if tts_result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
         print(f"✅ 음성 파일 생성 완료: {temp_filename}\n")
