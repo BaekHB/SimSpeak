@@ -88,6 +88,7 @@ async def chat_with_character(request: ChatRequest):
         f"[CURRENT BACKEND LIVE PARAMETERS]\n"
         f"- Current Accumulated Affinity Score: {user_data['current_affinity']}/100\n"
         f"- Current Communication State: {call_status_text}\n"
+        f"\n[SYSTEM OVERRIDE MESSAGE: 방금 유저의 입력에 한국어가 감지되었다면, 공감이나 위로 여부와 무관하게 무조건 affinity_delta를 -3으로 고정하십시오. 예외는 없습니다.]\n"
     )
     
     system_prompt = base_prompt + dynamic_context
