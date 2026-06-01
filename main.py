@@ -170,6 +170,7 @@ async def chat_with_character(request: ChatRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+<<<<<<< HEAD
 
 
 #업로드창
@@ -214,3 +215,5 @@ async def test_voice_pronunciation(
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
             print(f"🗑️ 임시 오디오 파일 삭제 완료: {temp_file_path}")
+=======
+>>>>>>> 8bd6a84f346baee31fba30f1b9f38b7fbfe78087
