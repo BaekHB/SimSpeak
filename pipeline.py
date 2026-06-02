@@ -70,7 +70,7 @@ class SimSpeakAIPipeline:
 
     def evaluate_dual_track(self, audio_url: str) -> tuple[str, dict]:
         """
-        오디오 URL을 다운로드하여 Whisper(한영 추출)와 Azure Speech(발음 평가)를 동시에 진행하는 투트랙 코어 엔진
+        오디오 URL을 다운로드하여 Whisper(원본 한영 추출)와 Azure Speech(발음 평가)를 진행하는 투트랙 코어 엔진
         """
         whisper_text = ""
         error_response = {
@@ -94,7 +94,7 @@ class SimSpeakAIPipeline:
                 f.write(response.content)
 
             # --------------------------------------------------
-            # ★ 트랙 1: Azure OpenAI Whisper (한영 혼용 텍스트 추출)
+            # ★ 트랙 1: Azure OpenAI Whisper (원본 한영 혼용 텍스트 전체 추출)
             # --------------------------------------------------
             try:
                 whisper_client = AzureOpenAI(
@@ -115,34 +115,26 @@ class SimSpeakAIPipeline:
                 print(f"Warning: Whisper STT failed: {e}")
 
             # --------------------------------------------------
-            # ★ 트랙 2: Azure Speech (영어 발음 정밀 평가)
+            # ★ 트랙 2: Azure Speech (한글 단어 오인식 배제 후 순수 영어만 채점)
             # --------------------------------------------------
             detailed_score = error_response
             try:
                 speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
                 audio_config = speechsdk.AudioConfig(filename=temp_eval_path)
                 
-                # =========================================================
-                # 🧼 ✨ [고도화 추가] Azure 발음평가 전용 영어 텍스트 정제 필터링
-                # =========================================================
-                # Whisper 결과물 문자열에서 모든 한글 자음/모음/완성형 글자를 완벽히 제외합니다.
+                # ✨ [유일한 백엔드 보조 기능]: 발음 채점기가 미쳐 날뛰지 않게 한글 글자만 일회성 정제
                 pure_english_reference = "".join(
                     char for char in whisper_text 
                     if not ('가' <= char <= '힣' or 'ㄱ' <= char <= 'ㅣ')
                 ).strip()
-                
-                # 불필요한 연속 공백을 정리하여 깨끗한 영어 문장으로 정렬
                 pure_english_reference = " ".join(pure_english_reference.split())
-                print(f"[Sync Track 2] Refined English Reference for Azure: '{pure_english_reference}'")
                 
-                # 비어있던 reference_text 자리에 정제된 순수 영어 기준 문자열을 강제 바인딩합니다.
                 pronunciation_config = speechsdk.PronunciationAssessmentConfig(
                     reference_text=pure_english_reference,
                     grading_system=speechsdk.PronunciationAssessmentGradingSystem.HundredMark,
                     granularity=speechsdk.PronunciationAssessmentGranularity.Word
                 )
                 pronunciation_config.enable_prosody_assessment()
-                # =========================================================
                 
                 speech_recognizer = speechsdk.SpeechRecognizer(
                     speech_config=speech_config, language="en-US", audio_config=audio_config
@@ -167,7 +159,6 @@ class SimSpeakAIPipeline:
                         "prosody": int(assessment_result.prosody_score),
                         "word_details": word_details_list
                     }
-                    print("[Sync Track 2] Azure Speech synchronized and evaluated successfully.")
                 else:
                     print(f"Warning: Pronunciation assessment failed or no match (Reason: {result.reason})")
             except Exception as e:
@@ -180,13 +171,11 @@ class SimSpeakAIPipeline:
             return whisper_text, error_response
             
         finally:
-            # 자원 명시적 해제하여 파일 잠금 해제
             if 'speech_recognizer' in locals():
                 del speech_recognizer
             if 'audio_config' in locals():
                 del audio_config
                 
-            # 에러 발생 여부와 상관없이 무조건 임시 파일 삭제하여 점유 버그 100% 차단
             if os.path.exists(temp_eval_path):
                 try:
                     os.remove(temp_eval_path)
@@ -200,21 +189,18 @@ class SimSpeakAIPipeline:
         temp_filename = f"reply_{uuid.uuid4().hex[:8]}.mp3"
         
         try:
-            # 1. Azure Speech SDK TTS 설정
             speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
             audio_config = speechsdk.audio.AudioOutputConfig(filename=temp_filename)
             
             synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
             
-            # 2. SSML 변환 후 음성 합성
             ssml_string = self.make_ssml(character_id, text_content)
             tts_result = synthesizer.speak_ssml_async(ssml_string).get()
             
             if tts_result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
                 print(f"Warning: TTS synthesis failed (Reason: {tts_result.reason})")
-                return "https://9aifinalteam4.blob.core.windows.net/audio-files/reply_8e9e195b.mp3" # 실패 시 기존 기본값 반환
+                return "https://9aifinalteam4.blob.core.windows.net/audio-files/reply_8e9e195b.mp3"
                 
-            # 3. Azure Blob Storage 업로드
             blob_service_client = BlobServiceClient.from_connection_string(self.storage_connection)
             container_name = "audio-files"
             blob_client = blob_service_client.get_blob_client(container=container_name, blob=temp_filename)
@@ -227,16 +213,14 @@ class SimSpeakAIPipeline:
 
         except Exception as e:
             print(f"Warning: TTS pipeline error: {e}")
-            return "https://9aifinalteam4.blob.core.windows.net/audio-files/reply_8e9e195b.mp3" # 에러 시 기본값 대체
+            return "https://9aifinalteam4.blob.core.windows.net/audio-files/reply_8e9e195b.mp3"
             
         finally:
-            # 자원 명시적 해제하여 파일 잠금 해제
             if 'synthesizer' in locals():
                 del synthesizer
             if 'audio_config' in locals():
                 del audio_config
                 
-            # 로컬 임시 오디오 파일 삭제
             if os.path.exists(temp_filename):
                 try:
                     os.remove(temp_filename)
@@ -253,7 +237,7 @@ class SimSpeakAIPipeline:
 
     def run(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None) -> dict:
         """
-        STT 입력 ➡️ 과거 기억 조회 ➡️ LLM 추론 ➡️ TTS 출력 생성까지 전체 AI 파이프라인을 조율하여 최종 JSON 데이터를 완성합니다.
+        STT 입력 ➡️ 과거 기억 조회 ➡️ LLM 추론 ➡️ TTS 출력 생성까지 전체 AI 파이프라인 조율
         """
         char_id = character_id.lower()
         print(f"[User: {user_id}] -> [{char_id}] Initial input: {user_text}")
@@ -265,14 +249,12 @@ class SimSpeakAIPipeline:
             session_db[user_id][char_id] = {"history": [], "current_affinity": 30, "summary_context": ""}
         user_data = session_db[user_id][char_id]
         
-        # summary_context 키 누락 방지 방어 코드
         if "summary_context" not in user_data:
             user_data["summary_context"] = ""
             
         current_summary = user_data["summary_context"]
 
         real_pronunciation_score = None
-        penalty_message = ""
         
         # 2. STT (Whisper) + 발음 평가 (Azure Speech) 투트랙 작동
         if user_audio_url:
@@ -282,32 +264,19 @@ class SimSpeakAIPipeline:
             # Whisper 분석 성공 시 유저 텍스트 덮어쓰기
             if extracted_text and not extracted_text.startswith("[Whisper"):
                 user_text = extracted_text
-                
-            # =========================================================
-            # ✨ 💡 [음성 모드 한국어 남용 방어 레이어 고도화]
-            # =========================================================
-            # Whisper가 음성에서 복원해 낸 텍스트 문장에 한국어 자음/모음/완성형 글자가 들어있는지 추적
-            has_korean_in_audio = any('가' <= char <= '힣' or 'ㄱ' <= char <= 'ㅣ' for char in user_text)
-            score_val = real_pronunciation_score.get("accuracy", 100)
-            
-            # [수정 포인트]: 영어 종합 발음 정확도가 50점 미만이거나, 음성 안에 한국어가 단 한 글자라도 포착된 경우 패널티 작동!
-            if score_val < 50 or has_korean_in_audio:
-                print(f"🚨 [Audio Guardrail Activated] Korean in Audio: {has_korean_in_audio} | Score: {score_val}")
-                penalty_message = "\n[SYSTEM OVERRIDE MESSAGE: 방금 유저가 보낸 음성에서 한국어가 감지되었거나 영어 발음이 불량합니다. 유저의 한국어 사용/나쁜 발음을 반드시 따끔하게 지적하고, 이번 턴의 affinity_delta를 무조건 -3으로 고정하여 출력하십시오. 예외는 없습니다.]"
-            # =========================================================
         else:
             print("Text-only mode -> Skipping pronunciation assessment.")
 
         # 3. LLM 추론 (Azure OpenAI GPT-4o)
+        # 파이프라인 단의 어떠한 인위적인 제약 조건문도 추가하지 않고, 
+        # 오직 정우님이 prompts/chloe.txt 파일에 명시해 둔 룰북 그대로 GPT에게 상속합니다.
         base_prompt = self.get_character_prompt(char_id)
         
-        # [요약 주입] 기존 압축 기억이 있다면 시스템 프롬프트 최상단에 주입
         summary_prefix = f"[PAST CONVERSATION SUMMARY]\n{current_summary}\n\n" if current_summary else ""
-        system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100" + penalty_message
+        system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Input Mode: is_video_call={is_video_call}"
         
         messages = [{"role": "system", "content": system_prompt}]
         
-        # 과거 history 배열에서 JSON 구조를 벗겨내고 순수한 대화 대사(content)만 추출하여 전달
         refined_history = []
         for turn in user_data["history"]:
             role = turn.get("role")
@@ -317,12 +286,10 @@ class SimSpeakAIPipeline:
                 refined_history.append({"role": "user", "content": content_raw})
             elif role == "assistant":
                 try:
-                    # DB에 적재되었던 JSON포맷 응답 문자열에서 순수 캐릭터 대사만 파싱
                     data = json.loads(content_raw)
                     pure_text = data.get("text_content") or data.get("content") or content_raw
                     refined_history.append({"role": "assistant", "content": pure_text})
                 except Exception:
-                    # 파싱 실패나 일반 문자열일 경우 안전장치 예외 처리
                     refined_history.append({"role": "assistant", "content": content_raw})
 
         # Azure OpenAI 공통 클라이언트 선언
@@ -332,11 +299,9 @@ class SimSpeakAIPipeline:
             api_version="2024-02-15-preview"
         )
 
-        # [토큰 절약 엔진 가동] 10턴 초과 시 잘려 나가는 앞부분 대화 압축하기
+        # [토큰 절약 엔진 가동] 10턴 초과 시 압축 로그 작동
         if len(refined_history) > 10:
-            overflow_turns = refined_history[:-10] # 윈도우 밖으로 버려질 대화 조각들
-            print(f"[Token Saving Engine] Compacting {len(overflow_turns)} overflow turns into long-term summary.")
-            
+            overflow_turns = refined_history[:-10]
             overflow_text = ""
             for turn in overflow_turns:
                 overflow_text += f"{turn['role']}: {turn['content']}\n"
@@ -354,26 +319,26 @@ class SimSpeakAIPipeline:
                 )
                 current_summary = summary_response.choices[0].message.content.strip()
                 user_data["summary_context"] = current_summary
-                print(f"[Token Saving Engine] Compaction complete. Long-term summary: {current_summary}")
             except Exception as e:
-                print(f"[Warning] Summary engine temporary error (retaining past summary): {e}")
+                print(f"[Warning] Summary engine temporary error: {e}")
 
-        # 문맥이 꼬이지 않도록 최신 10개의 정제된 턴만 슬라이딩 윈도우로 컨텍스트 주입
+        # 문맥 동기화 컨텍스트 주입
         messages.extend(refined_history[-10:])
         messages.append({"role": "user", "content": user_text})
 
         try:
+            # 프롬프트의 JSON Output Format Specification 정의서 그대로 GPT가 순수하게 파싱하도록 유도
             response = ai_client.chat.completions.create(
                 model=self.openai_deployment,
                 response_format={"type": "json_object"},
                 messages=messages
             )
-            raw_usage_log = json.loads(response.model_dump_json())
+            
             ai_response_text = response.choices[0].message.content
             ai_result = json.loads(ai_response_text)
-            ai_result["raw_llm_log"] = raw_usage_log
             
-            # 4. 과거 기억(세션) 업데이트 및 호감도 계산
+            # 4. 과거 기억(세션) 업데이트 및 호감도 반영
+            # 프롬프트 규칙에 의해 완벽히 조율되어 나온 affinity_delta 값을 그대로 승계하여 합산합니다. (파이프라인 침해 차단)
             affinity_delta = ai_result.get("affinity_delta", 0)
             user_data["history"].append({"role": "user", "content": user_text})
             user_data["history"].append({"role": "assistant", "content": ai_response_text})
@@ -383,14 +348,14 @@ class SimSpeakAIPipeline:
             character_reply = ai_result.get("text_content") or ai_result.get("content") or ""
             tts_audio_url = self.generate_tts(char_id, character_reply)
             
-            # 6. JSON 응답 최종 데이터 주머니(Response Body) 패키징
+            # 6. JSON 응답 최종 데이터 주머니 패키징
             ai_result["audio_url"] = tts_audio_url
             ai_result["current_total_affinity"] = user_data["current_affinity"]
             ai_result["user_recognized_text"] = user_text
             
+            # 발음 평가 리포트 구조 보존
             if "system_evaluation" not in ai_result:
                 ai_result["system_evaluation"] = {}
-                
             ai_result["system_evaluation"]["pronunciation_score"] = real_pronunciation_score
             
             return ai_result
