@@ -41,7 +41,7 @@ try:
 except Exception as db_err:
     print(f"❌ 데이터베이스 엔진 생성 실패: {db_err}")
 
-# DB에 생성될 chat_logs 테이블 구조 정의
+# DB에 생성될 chat_logs 테이블 구조 정의 (기존 구조 보존 + 요약 컬럼 추가)
 class ChatLogModel(Base):
     __tablename__ = "chat_logs"
 
@@ -55,6 +55,7 @@ class ChatLogModel(Base):
     current_affinity = Column(Integer, default=30)     # 영구 저장되는 호감도 스탯
     chat_history_context = Column(JSONB, nullable=False) # 대화 히스토리 배열 통째로 저장 (JSONB)
     raw_llm_log = Column(JSONB, nullable=False)          # 대표님 보고용 토큰 및 원본 생로그 (JSONB)
+    summary_context = Column(Text, nullable=True)        # 🧠 [토큰 절약] 오래된 과거 기억 압축 저장소 추가
 
 # 백엔드가 켜질 때 테이블이 없으면 자동으로 로컬 DB에 만들어 주는 안전장치
 try:
@@ -81,7 +82,7 @@ class ChatRequest(BaseModel):
     is_video_call: bool
     user_audio_url: Optional[str] = None  # 💡 다른 팀원이 Blob에 저장 후 넘겨줄 오디오 URL 주소!
 
-# 3. 💡 [정우님 투트랙 코어 엔진] 클라우드 URL 오디오 실시간 채점 + Whisper 한영 추출 
+# 3. 💡 [정우님 투트랙 코어 엔진] ⚠️ 절대 변경 금지 (기존 로직 완벽 보존)
 def evaluate_dual_track_from_url(audio_url: str) -> tuple[str, dict]:
     speech_key = os.getenv("AZURE_SPEECH_KEY")
     service_region = os.getenv("AZURE_SPEECH_REGION", "eastus")
@@ -175,19 +176,20 @@ def evaluate_dual_track_from_url(audio_url: str) -> tuple[str, dict]:
         print(f"⚠️ 코어 채점 엔진 내부 연산 중 오류 발생: {e}")
         return whisper_text, error_response
 
-
+# ⚠️ 절대 변경 금지 (기존 함수 보존)
 def get_character_prompt(character_id: str) -> str:
     file_path = f"prompts/{character_id.lower()}.txt"
     with open(file_path, "r", encoding="utf-8") as f:
         return f.read()
 
+
 # 4. 🚀 깔끔하게 정리된 완성형 엔드포인트
 @app.post("/chat")
-async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db)): # 💡 DB 세션 주입 완료
+async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db)): 
     char_id = request.character_id.lower()
     print(f"📥 [User: {request.user_id}] -> [{char_id}] 초기 입력: {request.text}")
 
-    # 🔄 💡 [DB 연동 이식] 기존 메모리 세션대신 로컬 DB에서 최신 데이터 1건 가져오기
+    # 🔄 💡 [DB 연동] 기존 메모리 세션대신 로컬 DB에서 최신 데이터 1건 가져오기
     last_log = db.query(ChatLogModel)\
         .filter(ChatLogModel.user_id == request.user_id, ChatLogModel.character_id == char_id)\
         .order_by(ChatLogModel.id.desc())\
@@ -195,11 +197,13 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
 
     if last_log:
         history = list(last_log.chat_history_context)
-        current_affinity = last_log.current_affinity
+        current_affinity = last_log.current_affinity  
+        current_summary = last_log.summary_context or ""  # 🧠 과거 누적 요약본 복구
         print(f"🧠 [장기기억 로드] 로컬 DB에서 과거 기억 복구 완료! (친밀도: {current_affinity}/100)")
     else:
         history = []
-        current_affinity = 30  # 최초 대화 시 기본 친밀도
+        current_affinity = 30  
+        current_summary = ""
         print("🆕 [새로운 대화] DB에 첫 기록을 생성합니다.")
 
     real_pronunciation_score = None
@@ -221,71 +225,129 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
     else:
         print("⌨️ 텍스트 전용 채팅 모드 ➡️ 발음 채점을 진행하지 않습니다.")
 
-    # 프롬프트 조립 및 패널티 결합
+    # Azure OpenAI 공통 클라이언트 선언
+    ai_client = AzureOpenAI(
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        api_version="2024-02-15-preview"
+    )
+
+    # =========================================================
+    # 🧠 [프롬프트 윈도우 & 컨텍스트 주입 최적화 설계 파트]
+    # =========================================================
     base_prompt = get_character_prompt(char_id)
-    system_prompt = base_prompt + f"\n\n[LIVE] Affinity: {current_affinity}/100" + penalty_message
+    
+    # 💡 [요약 주입] 기존 압축 기억이 있다면 시스템 프롬프트 최상단에 주입
+    summary_prefix = f"[PAST CONVERSATION SUMMARY]\n{current_summary}\n\n" if current_summary else ""
+    
+    system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {current_affinity}/100" + penalty_message
     
     messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history[-10:])
+    
+    # 과거 history 배열에서 JSON 구조를 벗겨내고 순수한 대화 대사(content)만 추출하여 전달
+    refined_history = []
+    for turn in history:
+        role = turn.get("role")
+        content_raw = turn.get("content", "")
+        
+        if role == "user":
+            refined_history.append({"role": "user", "content": content_raw})
+        elif role == "assistant":
+            try:
+                # DB에 적재되었던 JSON포맷 응답 문자열에서 순수 캐릭터 대사만 파싱
+                data = json.loads(content_raw)
+                pure_text = data.get("content", content_raw)
+                refined_history.append({"role": "assistant", "content": pure_text})
+            except Exception:
+                # 파싱 실패나 일반 문자열일 경우 안전장치 예외 처리
+                refined_history.append({"role": "assistant", "content": content_raw})
+
+    # 💡 [토큰 절약 엔진 가동] 10턴 초과 시 잘려 나가는 앞부분 대화 압축하기
+    if len(refined_history) > 10:
+        overflow_turns = refined_history[:-10] # 윈도우 밖으로 버려질 대화 조각들
+        print(f"🗜️ [토큰 절약] 윈도우를 초과한 {len(overflow_turns)}개의 대화 압축 연산을 수행합니다.")
+        
+        overflow_text = ""
+        for turn in overflow_turns:
+            overflow_text += f"{turn['role']}: {turn['content']}\n"
+            
+        summary_command = [
+            {"role": "system", "content": "너는 기억 파수꾼이야. 기존 [누적 요약본]에 새로 잊혀지려는 [대화 조각]의 핵심 사건이나 유저 정보만 결합해서 한 문장의 한국어로 지속 업데이트해 줘. 대화 로그 형식은 금지한다."},
+            {"role": "user", "content": f"[기존 누적 요약본]\n{current_summary}\n\n[새 대화 조각]\n{overflow_text}"}
+        ]
+        
+        try:
+            summary_response = ai_client.chat.completions.create(
+                model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+                messages=summary_command,
+                max_tokens=150
+            )
+            current_summary = summary_response.choices[0].message.content.strip()
+            print(f"📝 [요약 완료] 압축된 장기 기억: {current_summary}")
+        except Exception as e:
+            print(f"⚠️ 요약 엔진 일시 오류 발생 (기존 요약 보존): {e}")
+
+    # 문맥이 꼬이지 않도록 최신 10개의 정제된 턴만 슬라이딩 윈도우로 컨텍스트 주입 (원래 코드 동일)
+    messages.extend(refined_history[-10:])
+    
+    # 이번 턴 유저의 최신 입력을 대화창 맨 마지막에 추가
     messages.append({"role": "user", "content": request.text})
+    # =========================================================
 
     try:
         # Azure OpenAI 답변 생성
-        ai_client = AzureOpenAI(
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version="2024-02-15-preview"
-        )
         response = ai_client.chat.completions.create(
             model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
             response_format={"type": "json_object"},
             messages=messages
         )
         
-        raw_usage_log = json.loads(response.model_dump_json()) # 📊 대표님 보고용 Raw JSON 직렬화 로그 추출
+        raw_usage_log = json.loads(response.model_dump_json()) 
         ai_response_text = response.choices[0].message.content
         ai_result = json.loads(ai_response_text)
         
-        # 친밀도 수치 갱신 및 히스토리 업데이트
+        # 호감도 보정 계산
         affinity_delta = ai_result.get("affinity_delta", 0)
+        updated_affinity = max(0, min(100, current_affinity + affinity_delta)) 
+
+        # 🧠 파이썬 메모리 히스토리 업데이트 (다음 턴을 위해 저장 준비)
         history.append({"role": "user", "content": request.text})
         history.append({"role": "assistant", "content": ai_response_text})
-        updated_affinity = max(0, min(100, current_affinity + affinity_delta))
 
         # 결과 주머니 패키징
         mock_ai_audio_url = "https://9aifinalteam4.blob.core.windows.net/audio-files/reply_8e9e195b.mp3"
         ai_result["audio_url"] = mock_ai_audio_url
-        ai_result["current_total_affinity"] = updated_affinity
-        ai_result["user_recognized_text"] = request.text # 프론트에 Whisper 텍스트 반환
+        ai_result["current_total_affinity"] = updated_affinity 
+        ai_result["user_recognized_text"] = request.text 
         
         if "system_evaluation" not in ai_result:
             ai_result["system_evaluation"] = {}
             
-        # 🔥 실시간으로 연산된 리얼 발음 점수 주입
         ai_result["system_evaluation"]["pronunciation_score"] = real_pronunciation_score
         
         # =========================================================
-        # 💾 💡 [DB 연동 이식] 대화 내용 및 모니터링 생로그 DB 영구 저장
+        # 💾 💡 대화 내용 및 모니터링 생로그 DB 영구 저장
         # =========================================================
         new_log = ChatLogModel(
             user_id=request.user_id,
             character_id=char_id,
             user_text=request.text,
-            user_audio_url=request.user_audio_url,             # 클라우드에 올라간 유저 진짜 오디오 주소 연동
+            user_audio_url=request.user_audio_url,             
             ai_text_content=ai_result.get("content", ""),
             ai_audio_url=mock_ai_audio_url,
-            current_affinity=updated_affinity,       
-            chat_history_context=history,                      # JSONB 타입으로 대화 배열 통째로 적재
-            raw_llm_log=raw_usage_log                          # JSONB 타입으로 토큰 사용량 원본 생로그 저장
+            current_affinity=updated_affinity,                 
+            chat_history_context=history,                      
+            raw_llm_log=raw_usage_log,
+            summary_context=current_summary  # 🧠 압축 누적된 장기 기억 요약본 저장
         )
         db.add(new_log)
-        db.commit() # 데이터베이스 저장 확정!
-        print("💾 [DB 성공] 로컬 PostgreSQL 금고에 대화 및 AI 모니터링 로그가 안전하게 적재되었습니다.")
+        db.commit() 
+        print(f"💾 [DB 성공] 로컬 PostgreSQL 금고에 로그 및 요약본 적재 완료! (저장된 친밀도: {updated_affinity}/100)")
         # =========================================================
         
         return ai_result
 
     except Exception as e:
-        db.rollback() # 에러 발생 시 데이터 정합성을 위해 트랜잭션 롤백
+        db.rollback() 
         print(f"❌ 파이프라인 처리 중 에러 발생: {e}")
         raise HTTPException(status_code=500, detail=str(e))
