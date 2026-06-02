@@ -27,9 +27,13 @@ app = FastAPI(title="SimSpeak Production Pronunciation Core API")
 
 
 # =========================================================
-# 🗄️ 💡 [DB 고정] 로컬 PostgreSQL 연결 설정 파트 (완전 고정)
+# 🗄️ 💡 [DB 연동 고도화] .env 환경변수에서 네온 DB 주소 안전하게 로드
 # =========================================================
-DATABASE_URL = "postgresql://postgres:1234@127.0.0.1:5432/postgres"
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# (방어 코드) 혹시라도 .env에서 못 읽어왔을 때를 대비한 로컬 백업 주소
+if not DATABASE_URL:
+    DATABASE_URL = "postgresql://postgres:1234@127.0.0.1:5432/postgres"
 
 print(f"📡 [🚨연결 시도] 코드가 지금 바라보는 진짜 DB 주소: {DATABASE_URL}")
 
@@ -41,7 +45,7 @@ try:
 except Exception as db_err:
     print(f"❌ 데이터베이스 엔진 생성 실패: {db_err}")
 
-# DB에 생성될 chat_logs 테이블 구조 정의 (기존 구조 보존 + 요약 컬럼 추가)
+# DB에 생성될 chat_logs 테이블 구조 정의
 class ChatLogModel(Base):
     __tablename__ = "chat_logs"
 
@@ -55,9 +59,9 @@ class ChatLogModel(Base):
     current_affinity = Column(Integer, default=30)     # 영구 저장되는 호감도 스탯
     chat_history_context = Column(JSONB, nullable=False) # 대화 히스토리 배열 통째로 저장 (JSONB)
     raw_llm_log = Column(JSONB, nullable=False)          # 대표님 보고용 토큰 및 원본 생로그 (JSONB)
-    summary_context = Column(Text, nullable=True)        # 🧠 [토큰 절약] 오래된 과거 기억 압축 저장소 추가
+    summary_context = Column(Text, nullable=True)        # 🧠 [토큰 절약] 오래된 과거 기억 압축 저장소
 
-# 백엔드가 켜질 때 테이블이 없으면 자동으로 로컬 DB에 만들어 주는 안전장치
+# 백엔드가 켜질 때 테이블이 없으면 자동으로 네온 DB 클라우드에 만들어 주는 안전장치
 try:
     Base.metadata.create_all(bind=engine)
     print("💾 [DB 성공] chat_logs 테이블 생성 혹은 연결 검증 완료!")
@@ -189,7 +193,7 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
     char_id = request.character_id.lower()
     print(f"📥 [User: {request.user_id}] -> [{char_id}] 초기 입력: {request.text}")
 
-    # 🔄 💡 [DB 연동] 기존 메모리 세션대신 로컬 DB에서 최신 데이터 1건 가져오기
+    # 🔄 💡 [DB 연동] 지정된 클라우드 DB에서 최신 데이터 1건 가져오기
     last_log = db.query(ChatLogModel)\
         .filter(ChatLogModel.user_id == request.user_id, ChatLogModel.character_id == char_id)\
         .order_by(ChatLogModel.id.desc())\
@@ -198,8 +202,8 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
     if last_log:
         history = list(last_log.chat_history_context)
         current_affinity = last_log.current_affinity  
-        current_summary = last_log.summary_context or ""  # 🧠 과거 누적 요약본 복구
-        print(f"🧠 [장기기억 로드] 로컬 DB에서 과거 기억 복구 완료! (친밀도: {current_affinity}/100)")
+        current_summary = last_log.summary_context or ""  # 장기 기억 복구
+        print(f"🧠 [장기기억 로드] 클라우드 DB에서 과거 기억 복구 완료! (친밀도: {current_affinity}/100)")
     else:
         history = []
         current_affinity = 30  
@@ -237,7 +241,7 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
     # =========================================================
     base_prompt = get_character_prompt(char_id)
     
-    # 💡 [요약 주입] 기존 압축 기억이 있다면 시스템 프롬프트 최상단에 주입
+    # [요약 주입] 기존 압축 기억이 있다면 시스템 프롬프트 최상단에 주입
     summary_prefix = f"[PAST CONVERSATION SUMMARY]\n{current_summary}\n\n" if current_summary else ""
     
     system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {current_affinity}/100" + penalty_message
@@ -287,7 +291,7 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
         except Exception as e:
             print(f"⚠️ 요약 엔진 일시 오류 발생 (기존 요약 보존): {e}")
 
-    # 문맥이 꼬이지 않도록 최신 10개의 정제된 턴만 슬라이딩 윈도우로 컨텍스트 주입 (원래 코드 동일)
+    # 문맥이 꼬이지 않도록 최신 10개의 정제된 턴만 슬라이딩 윈도우로 컨텍스트 주입
     messages.extend(refined_history[-10:])
     
     # 이번 턴 유저의 최신 입력을 대화창 맨 마지막에 추가
@@ -338,11 +342,11 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
             current_affinity=updated_affinity,                 
             chat_history_context=history,                      
             raw_llm_log=raw_usage_log,
-            summary_context=current_summary  # 🧠 압축 누적된 장기 기억 요약본 저장
+            summary_context=current_summary  # 압축 누적된 장기 기억 요약본 저장
         )
         db.add(new_log)
         db.commit() 
-        print(f"💾 [DB 성공] 로컬 PostgreSQL 금고에 로그 및 요약본 적재 완료! (저장된 친밀도: {updated_affinity}/100)")
+        print(f"💾 [DB 성공] 클라우드 네온 DB 금고에 로그 및 요약본 적재 완료! (저장된 친밀도: {updated_affinity}/100)")
         # =========================================================
         
         return ai_result
