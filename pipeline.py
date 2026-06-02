@@ -109,6 +109,7 @@ class SimSpeakAIPipeline:
                         prompt="Hello! 안녕하세요."
                     )
                 whisper_text = whisper_result.text
+                print(f"[Sync Track 1] Whisper Master Text Extracted: '{whisper_text}'")
             except Exception as e:
                 whisper_text = f"[Whisper 에러: {e}]"
                 print(f"Warning: Whisper STT failed: {e}")
@@ -121,12 +122,27 @@ class SimSpeakAIPipeline:
                 speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
                 audio_config = speechsdk.AudioConfig(filename=temp_eval_path)
                 
+                # =========================================================
+                # 🧼 ✨ [고도화 추가] Azure 발음평가 전용 영어 텍스트 정제 필터링
+                # =========================================================
+                # Whisper 결과물 문자열에서 모든 한글 자음/모음/완성형 글자를 완벽히 제외합니다.
+                pure_english_reference = "".join(
+                    char for char in whisper_text 
+                    if not ('가' <= char <= '힣' or 'ㄱ' <= char <= 'ㅣ')
+                ).strip()
+                
+                # 불필요한 연속 공백을 정리하여 깨끗한 영어 문장으로 정렬
+                pure_english_reference = " ".join(pure_english_reference.split())
+                print(f"[Sync Track 2] Refined English Reference for Azure: '{pure_english_reference}'")
+                
+                # 비어있던 reference_text 자리에 정제된 순수 영어 기준 문자열을 강제 바인딩합니다.
                 pronunciation_config = speechsdk.PronunciationAssessmentConfig(
-                    reference_text="",
+                    reference_text=pure_english_reference,
                     grading_system=speechsdk.PronunciationAssessmentGradingSystem.HundredMark,
                     granularity=speechsdk.PronunciationAssessmentGranularity.Word
                 )
                 pronunciation_config.enable_prosody_assessment()
+                # =========================================================
                 
                 speech_recognizer = speechsdk.SpeechRecognizer(
                     speech_config=speech_config, language="en-US", audio_config=audio_config
@@ -151,6 +167,7 @@ class SimSpeakAIPipeline:
                         "prosody": int(assessment_result.prosody_score),
                         "word_details": word_details_list
                     }
+                    print("[Sync Track 2] Azure Speech synchronized and evaluated successfully.")
                 else:
                     print(f"Warning: Pronunciation assessment failed or no match (Reason: {result.reason})")
             except Exception as e:
