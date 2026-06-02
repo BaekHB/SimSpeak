@@ -6,7 +6,11 @@ __pycache__/
 *.pyc
 venv/
 env/
+.venv/
 
 # 임시 오디오 파일
 *.mp3
 *.wav
+
+# 에디터 설정
+.vscode/
