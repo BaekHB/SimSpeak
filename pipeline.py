@@ -1,8 +1,10 @@
 import os
 import uuid
 import json
-import requests
-from openai import AzureOpenAI
+import asyncio
+import httpx
+import aiofiles
+from openai import AsyncAzureOpenAI
 import azure.cognitiveservices.speech as speechsdk
 from azure.storage.blob import BlobServiceClient
 
@@ -51,44 +53,70 @@ class SimSpeakAIPipeline:
         </speak>
         """
 
-    def evaluate_dual_track(self, audio_url: str) -> tuple[str, dict]:
+    async def evaluate_dual_track(self, user_id: str, audio_url: str) -> tuple[str, dict]:
         whisper_text = ""
         error_response = {"accuracy": 0, "fluency": 0, "completeness": 0, "prosody": 0, "word_details": []}
         if not audio_url: return whisper_text, error_response
 
         temp_eval_path = f"temp_eval_{uuid.uuid4().hex[:8]}.wav"
+        print(f" ⏳ [ASYNC TRACK START] User '{user_id}' - Downloading audio via HTTPX...")
+        
         try:
-            response = requests.get(audio_url, timeout=15)
-            if response.status_code != 200: return whisper_text, error_response
-            with open(temp_eval_path, "wb") as f: f.write(response.content)
+            # httpx를 활용한 비동기 오디오 스트림 다운로드
+            async with httpx.AsyncClient() as client:
+                response = await client.get(audio_url, timeout=15.0)
+                if response.status_code != 200: return whisper_text, error_response
+                
+                # 디스크 쓰기 비동기 최적화
+                async with aiofiles.open(temp_eval_path, "wb") as f:
+                    await f.write(response.content)
 
-            # Track 1: Whisper
+            print(f" 🚀 [ASYNC FLOW] User '{user_id}' - Audio download complete. Running Whisper & Speech Evaluation...")
+
+            # Track 1: Whisper 비동기 클라이언트 호출
             try:
-                whisper_client = AzureOpenAI(azure_endpoint=self.whisper_endpoint, api_key=self.whisper_key, api_version="2024-02-15-preview")
+                whisper_client = AsyncAzureOpenAI(
+                    azure_endpoint=self.whisper_endpoint, 
+                    api_key=self.whisper_key, 
+                    api_version="2024-02-15-preview"
+                )
                 with open(temp_eval_path, "rb") as audio_file:
-                    whisper_result = whisper_client.audio.transcriptions.create(file=audio_file, model=self.whisper_deployment, prompt="Hello! 안녕하세요.")
+                    whisper_result = await whisper_client.audio.transcriptions.create(
+                        file=audio_file, 
+                        model=self.whisper_deployment, 
+                        prompt="Hello! 안녕하세요."
+                    )
                 whisper_text = whisper_result.text
-            except: pass
+                print(f" 🔍 [ASYNC FLOW] User '{user_id}' - Whisper Text Extracted: '{whisper_text}'")
+            except Exception as e:
+                print(f" ❌ [WHISPER ERROR] User '{user_id}' - {e}")
 
-            # Track 2: Azure Speech
+            # Track 2: Azure Speech (SDK 차단 연산을 별도 워커 스레드 풀로 완벽하게 격리)
             detailed_score = error_response
             try:
-                speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
-                audio_config = speechsdk.AudioConfig(filename=temp_eval_path)
-                
-                pure_english_reference = "".join(char for char in whisper_text if not ('가' <= char <= '힣' or 'ㄱ' <= char <= 'ㅣ')).strip()
-                pure_english_reference = " ".join(pure_english_reference.split())
-                
-                pronunciation_config = speechsdk.PronunciationAssessmentConfig(
-                    reference_text=pure_english_reference,
-                    grading_system=speechsdk.PronunciationAssessmentGradingSystem.HundredMark,
-                    granularity=speechsdk.PronunciationAssessmentGranularity.Word
-                )
-                pronunciation_config.enable_prosody_assessment()
-                
-                speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, language="en-US", audio_config=audio_config)
-                pronunciation_config.apply_to(speech_recognizer)
-                result = speech_recognizer.recognize_once_async().get()
+                def run_speech_assessment():
+                    speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
+                    audio_config = speechsdk.AudioConfig(filename=temp_eval_path)
+                    
+                    pure_english_reference = "".join(char for char in whisper_text if not ('가' <= char <= '힣' or 'ㄱ' <= char <= 'ㅣ')).strip()
+                    pure_english_reference = " ".join(pure_english_reference.split())
+                    
+                    pronunciation_config = speechsdk.PronunciationAssessmentConfig(
+                        reference_text=pure_english_reference,
+                        grading_system=speechsdk.PronunciationAssessmentGradingSystem.HundredMark,
+                        granularity=speechsdk.PronunciationAssessmentGranularity.Word
+                    )
+                    pronunciation_config.enable_prosody_assessment()
+                    
+                    speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, language="en-US", audio_config=audio_config)
+                    pronunciation_config.apply_to(speech_recognizer)
+                    
+                    # 동기 차단성 SDK 호출
+                    result = speech_recognizer.recognize_once_async().get()
+                    return result
+
+                # 메인 루프를 멈추지 않고 비동기 백그라운드 스레드에서 처리
+                result = await asyncio.to_thread(run_speech_assessment)
                 
                 if result.reason == speechsdk.ResultReason.RecognizedSpeech:
                     assessment_result = speechsdk.PronunciationAssessmentResult(result)
@@ -106,42 +134,57 @@ class SimSpeakAIPipeline:
                         "prosody": int(assessment_result.prosody_score),
                         "word_details": word_details_list
                     }
-            except: pass
+                    print(f" ✅ [ASYNC FLOW] User '{user_id}' - Pronunciation Score calculated successfully.")
+            except Exception as e:
+                print(f" ❌ [SPEECH ERROR] User '{user_id}' - {e}")
+                
             return whisper_text, detailed_score
-        except: return whisper_text, error_response
+        except Exception as e:
+            print(f" ❌ [DUAL TRACK CRITICAL ERROR] User '{user_id}' - {e}")
+            return whisper_text, error_response
         finally:
-            if 'speech_recognizer' in locals():
-                try: del speech_recognizer
-                except: pass
-            if 'audio_config' in locals():
-                try: del audio_config
-                except: pass
             if os.path.exists(temp_eval_path):
                 try: os.remove(temp_eval_path)
                 except: pass
 
-    def generate_tts(self, character_id: str, text_content: str) -> str:
+    async def generate_tts(self, user_id: str, character_id: str, text_content: str) -> str:
         temp_filename = f"reply_{uuid.uuid4().hex[:8]}.mp3"
+        print(f" ⏳ [ASYNC TTS START] User '{user_id}' - Generating Azure TTS in worker thread...")
         try:
-            speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
-            audio_config = speechsdk.audio.AudioOutputConfig(filename=temp_filename)
-            synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
-            
-            synthesizer.speak_ssml_async(self.make_ssml(character_id, text_content)).get()
-            blob_service_client = BlobServiceClient.from_connection_string(self.storage_connection)
-            blob_client = blob_service_client.get_blob_client(container="audio-files", blob=temp_filename)
-            with open(temp_filename, "rb") as data: blob_client.upload_blob(data, overwrite=True)
-            return blob_client.url
-        except: return "https://9aifinalteam4.blob.core.windows.net/audio-files/reply_8e9e195b.mp3"
+            def run_tts_synthesis():
+                speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
+                audio_config = speechsdk.audio.AudioOutputConfig(filename=temp_filename)
+                synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+                synthesizer.speak_ssml_async(self.make_ssml(character_id, text_content)).get()
+
+            # Azure TTS 차단 연산 해결
+            await asyncio.to_thread(run_tts_synthesis)
+
+            # Storage 업로드 IO 분리
+            def upload_to_blob():
+                blob_service_client = BlobServiceClient.from_connection_string(self.storage_connection)
+                blob_client = blob_service_client.get_blob_client(container="audio-files", blob=temp_filename)
+                with open(temp_filename, "rb") as data: 
+                    blob_client.upload_blob(data, overwrite=True)
+                return blob_client.url
+
+            blob_url = await asyncio.to_thread(upload_to_blob)
+            print(f" ✅ [ASYNC TTS END] User '{user_id}' - TTS file uploaded: {blob_url}")
+            return blob_url
+        except Exception as e:
+            print(f" ❌ [TTS ERROR] User '{user_id}' - {e}. Falling back to default url.")
+            return "https://9aifinalteam4.blob.core.windows.net/audio-files/reply_8e9e195b.mp3"
         finally:
             if os.path.exists(temp_filename):
                 try: os.remove(temp_filename)
                 except: pass
 
-    def get_character_prompt(self, character_id: str) -> str:
-        with open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: return f.read()
+    async def get_character_prompt(self, character_id: str) -> str:
+        # 파일 읽기 비동기화
+        async with aiofiles.open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: 
+            return await f.read()
 
-    def run(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None) -> dict:
+    async def run(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None) -> dict:
         char_id = character_id.lower()
         if user_id not in session_db: session_db[user_id] = {}
         if char_id not in session_db[user_id]:
@@ -150,10 +193,10 @@ class SimSpeakAIPipeline:
 
         real_pronunciation_score = None
         if user_audio_url:
-            extracted_text, real_pronunciation_score = self.evaluate_dual_track(user_audio_url)
+            extracted_text, real_pronunciation_score = await self.evaluate_dual_track(user_id, user_audio_url)
             if extracted_text: user_text = extracted_text
 
-        base_prompt = self.get_character_prompt(char_id)
+        base_prompt = await self.get_character_prompt(char_id)
         system_prompt = base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Input Mode: is_video_call={is_video_call}"
         
         messages = [{"role": "system", "content": system_prompt}]
@@ -162,28 +205,30 @@ class SimSpeakAIPipeline:
         messages.append({"role": "user", "content": user_text})
 
         try:
-            ai_client = AzureOpenAI(azure_endpoint=self.openai_endpoint, api_key=self.openai_key, api_version="2024-02-15-preview")
-            response = ai_client.chat.completions.create(model=self.openai_deployment, response_format={"type": "json_object"}, messages=messages)
+            print(f" 🧠 [ASYNC LLM CALL] User '{user_id}' - Requesting AsyncAzureOpenAI...")
+            ai_client = AsyncAzureOpenAI(azure_endpoint=self.openai_endpoint, api_key=self.openai_key, api_version="2024-02-15-preview")
+            response = await ai_client.chat.completions.create(model=self.openai_deployment, response_format={"type": "json_object"}, messages=messages)
+            
             ai_result = json.loads(response.choices[0].message.content)
+            print(f" 🎉 [ASYNC LLM SUCCESS] User '{user_id}' - LLM generation finished.")
             
             user_data["history"].append({"role": "user", "content": user_text})
             user_data["history"].append({"role": "assistant", "content": response.choices[0].message.content})
             user_data["current_affinity"] = max(0, min(100, user_data["current_affinity"] + ai_result.get("affinity_delta", 0)))
 
-            ai_result["audio_url"] = self.generate_tts(char_id, ai_result.get("text_content", ""))
+            # 비동기 TTS 구동 및 바인딩
+            ai_result["audio_url"] = await self.generate_tts(user_id, char_id, ai_result.get("text_content", ""))
             ai_result["current_total_affinity"] = user_data["current_affinity"]
             ai_result["user_recognized_text"] = user_text
             
             if "system_evaluation" not in ai_result: ai_result["system_evaluation"] = {}
             
-            # 1. 문법 교정 오리지널 스펙 유지 및 방어
             if "corrections" not in ai_result["system_evaluation"] or not ai_result["system_evaluation"]["corrections"]:
                 ai_result["system_evaluation"]["corrections"] = [
                     {"original_sentence": "Hey, 자기야. I was so 감동했어.", "corrected_sentence": "Hey, honey. I was so touched."},
                     {"original_sentence": "you're truly my 최고야.", "corrected_sentence": "you're truly my best."}
                 ]
 
-            # 2. 독립형 발음 기호 맵 (75점 미만 대응용) - 오직 guide(표준 발음)만 관리
             fallback_ipa_map = {
                 "hey": "[heɪ]", "truly": "[ˈtruːli]", "i": "[aɪ]",
                 "was": "[wʌz]", "so": "[soʊ]", "text": "[tekst]", "my": "[maɪ]"
@@ -196,15 +241,12 @@ class SimSpeakAIPipeline:
                     acc = word_obj.get("accuracy", 0)
                     w_lower = word_obj["word"].lower().replace(",", "").replace(".", "")
                     
-                    # 🚨 요구사항 반영: my_pronunciation 필드는 하위 주머니에서 아예 제거(제외)합니다.
                     if "my_pronunciation" in word_obj:
                         del word_obj["my_pronunciation"]
                     
                     if acc >= 75:
-                        # 75점 이상 고득점 단어는 가이드 클리어
                         word_obj["guide"] = ""
                     else:
-                        # 75점 미만인 경우에만 오직 guide 필드만 추론하여 노출
                         matching_gpt_word = next((w for w in gpt_details if w.get("word", "").lower() == w_lower), None)
                         g_val = matching_gpt_word.get("guide", "") if matching_gpt_word else ""
                         
@@ -215,7 +257,6 @@ class SimSpeakAIPipeline:
                 
                 ai_result["system_evaluation"]["pronunciation_score"] = real_pronunciation_score
                 
-                # 3. 발음 종합 총평 (pronunciation_feedback) 생성 및 안전 벨트 세팅
                 feedback_text = ai_result.get("system_evaluation", {}).get("pronunciation_feedback", "")
                 if not feedback_text or len(feedback_text.strip()) < 5:
                     fluency_val = real_pronunciation_score.get("fluency", 0)
@@ -236,4 +277,5 @@ class SimSpeakAIPipeline:
             
             return ai_result
         except Exception as e:
+            print(f" ❌ [RUN CRITICAL ERROR] User '{user_id}' - {e}")
             raise e
