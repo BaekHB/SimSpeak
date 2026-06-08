@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+requests
+openai
+azure-cognitiveservices-speech
+azure-storage-blob
+sqlalchemy
+psycopg2-binary
+python-dotenv
