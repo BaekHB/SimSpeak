@@ -55,7 +55,7 @@ class SimSpeakAIPipeline:
 
     async def evaluate_dual_track(self, user_id: str, audio_url: str) -> tuple[str, dict]:
         whisper_text = ""
-        error_response = {"accuracy": 0, "fluency": 0, "completeness": 0, "prosody": 0, "word_details": []}
+        error_response = {"accuracy": 0, "fluency": 0, "completeness": 0, "prosody": 0, "word_details_json": []}
         if not audio_url: return whisper_text, error_response
 
         temp_eval_path = f"temp_eval_{uuid.uuid4().hex[:8]}.wav"
@@ -127,12 +127,13 @@ class SimSpeakAIPipeline:
                             "accuracy": int(word.accuracy_score),
                             "error_type": word.error_type if word.error_type != "None" else None
                         })
+                    # ERD 기준에 따라 세부 단어 리스트 Key 명칭을 word_details_json으로 빌드
                     detailed_score = {
                         "accuracy": int(assessment_result.accuracy_score),
                         "fluency": int(assessment_result.fluency_score),
                         "completeness": int(assessment_result.completeness_score),
                         "prosody": int(assessment_result.prosody_score),
-                        "word_details": word_details_list
+                        "word_details_json": word_details_list
                     }
                     print(f" ✅ [ASYNC FLOW] User '{user_id}' - Pronunciation Score calculated successfully.")
             except Exception as e:
@@ -191,9 +192,9 @@ class SimSpeakAIPipeline:
             session_db[user_id][char_id] = {"history": [], "current_affinity": 30, "summary_context": ""}
         user_data = session_db[user_id][char_id]
 
-        real_pronunciation_score = None
+        real_pronunciation_evaluations = None
         if user_audio_url:
-            extracted_text, real_pronunciation_score = await self.evaluate_dual_track(user_id, user_audio_url)
+            extracted_text, real_pronunciation_evaluations = await self.evaluate_dual_track(user_id, user_audio_url)
             if extracted_text: user_text = extracted_text
 
         base_prompt = await self.get_character_prompt(char_id)
@@ -221,10 +222,15 @@ class SimSpeakAIPipeline:
             ai_result["current_total_affinity"] = user_data["current_affinity"]
             ai_result["user_recognized_text"] = user_text
             
+            # --- ERD 기준 매핑에 따른 데이터 Key 변환 레이어 시작 ---
             if "system_evaluation" not in ai_result: ai_result["system_evaluation"] = {}
             
-            if "corrections" not in ai_result["system_evaluation"] or not ai_result["system_evaluation"]["corrections"]:
-                ai_result["system_evaluation"]["corrections"] = [
+            # 1. corrections -> corrections_json 명칭 스위칭 보정
+            if "corrections" in ai_result["system_evaluation"]:
+                ai_result["system_evaluation"]["corrections_json"] = ai_result["system_evaluation"].pop("corrections")
+            
+            if "corrections_json" not in ai_result["system_evaluation"] or not ai_result["system_evaluation"]["corrections_json"]:
+                ai_result["system_evaluation"]["corrections_json"] = [
                     {"original_sentence": "Hey, 자기야. I was so 감동했어.", "corrected_sentence": "Hey, honey. I was so touched."},
                     {"original_sentence": "you're truly my 최고야.", "corrected_sentence": "you're truly my best."}
                 ]
@@ -234,10 +240,11 @@ class SimSpeakAIPipeline:
                 "was": "[wʌz]", "so": "[soʊ]", "text": "[tekst]", "my": "[maɪ]"
             }
 
-            if real_pronunciation_score and len(real_pronunciation_score.get("word_details", [])) > 0:
+            # 2. pronunciation_score -> pronunciation_evaluations 명칭 스위칭 및 내부 word_details 가이드 맵핑
+            if real_pronunciation_evaluations and len(real_pronunciation_evaluations.get("word_details_json", [])) > 0:
                 gpt_details = ai_result.get("system_evaluation", {}).get("pronunciation_score", {}).get("word_details", []) or []
                 
-                for word_obj in real_pronunciation_score.get("word_details", []):
+                for word_obj in real_pronunciation_evaluations.get("word_details_json", []):
                     acc = word_obj.get("accuracy", 0)
                     w_lower = word_obj["word"].lower().replace(",", "").replace(".", "")
                     
@@ -255,12 +262,15 @@ class SimSpeakAIPipeline:
                             
                         word_obj["guide"] = g_val if (g_val.startswith("[") or not g_val) else f"[{g_val}]"
                 
-                ai_result["system_evaluation"]["pronunciation_score"] = real_pronunciation_score
+                # 가이드 맵핑 완료된 객체를 최종 ERD 테이블명에 맞춰 주입 (기존 pronunciation_score 필드는 제거)
+                if "pronunciation_score" in ai_result["system_evaluation"]:
+                    ai_result["system_evaluation"].pop("pronunciation_score")
+                ai_result["system_evaluation"]["pronunciation_evaluations"] = real_pronunciation_evaluations
                 
                 feedback_text = ai_result.get("system_evaluation", {}).get("pronunciation_feedback", "")
                 if not feedback_text or len(feedback_text.strip()) < 5:
-                    fluency_val = real_pronunciation_score.get("fluency", 0)
-                    accuracy_val = real_pronunciation_score.get("accuracy", 0)
+                    fluency_val = real_pronunciation_evaluations.get("fluency", 0)
+                    accuracy_val = real_pronunciation_evaluations.get("accuracy", 0)
                     
                     if accuracy_val >= 85 and fluency_val >= 80:
                         feedback_text = "전반적으로 단어의 정확한 발음은 물론, 문장의 자연스러운 억양과 연결음 구사력이 매우 훌륭합니다. 원어민에 가까운 리듬감과 유창성을 유지하고 있어 훌륭한 전달력을 보여주고 있습니다."
@@ -271,8 +281,9 @@ class SimSpeakAIPipeline:
                 
                 ai_result["system_evaluation"]["pronunciation_feedback"] = feedback_text
             else:
-                if "pronunciation_score" not in ai_result["system_evaluation"]:
-                    ai_result["system_evaluation"]["pronunciation_score"] = None
+                if "pronunciation_score" in ai_result["system_evaluation"]:
+                    ai_result["system_evaluation"].pop("pronunciation_score")
+                ai_result["system_evaluation"]["pronunciation_evaluations"] = None
                 ai_result["system_evaluation"]["pronunciation_feedback"] = None
             
             return ai_result
