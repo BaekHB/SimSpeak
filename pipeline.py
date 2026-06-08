@@ -262,10 +262,69 @@ class SimSpeakAIPipeline:
             except Exception as e:
                 print(f"[Warning] Summary engine temporary error: {e}")
 
+        # ==========================================================
+        # 🧠 [자동 난이도 스위칭 로직] stage_id 기반 어휘력/철벽 방어력 세팅
+        # ==========================================================
+        # 프론트에서 보낸 stage_id를 깔끔하게 다듬기 (예: "Stage 1" -> "stage_1")
+        stage_clean = str(stage_id).lower().strip().replace(" ", "_")
+        
+        # 🟢 [쉬움] Stage 1, 2
+        if stage_clean in ["stage_1", "stage_2"]:
+            difficulty_instruction = """
+            [System Directive: Easy Mode]
+            1. 성격(호구 모드): 유저의 말에 매우 호의적이고 긍정적으로 리액션하며, 제안을 흔쾌히 수락하세요.
+            2. 어휘 수준: 초급 수준(Beginner/A1 level)의 아주 기초적인 단어와 짧고 명확한 문장만을 사용하세요.
+            3. 목표: 유저가 대화에 자신감을 가질 수 있도록 친절하게 대하세요.
+            """
+        # 🔴 [어려움] Stage 7, 8, 보너스 후반
+        elif stage_clean in ["stage_7", "stage_8", "bonus_2", "bonus_stage_2"]:
+            difficulty_instruction = """
+            [System Directive: Hard Mode]
+            1. 성격(철벽): 유저의 제안, 부탁, 혹은 질문에 매우 방어적이고 까다롭게 반응하세요. 쉽게 동의하지 마세요.
+            2. 어휘 수준: 원어민 비즈니스 수준의 고급 어휘(Advanced/C1 level), 숙어, 그리고 복잡하고 긴 문장 구조를 사용하세요.
+            3. 목표: 유저가 당신을 설득하기 위해 더 구체적이고 논리적인 대답을 하도록 유도하세요.
+            """
+        # 🟡 [중간] Stage 3, 4, 5, 6, 보너스 초반 (그 외 전부)
+        else:
+             difficulty_instruction = """
+            [System Directive: Medium Mode]
+            1. 성격: 약간의 의심을 가지지만, 유저가 타당한 이유를 대면 호응해 줍니다.
+            2. 어휘 수준: 중급 수준(Intermediate/B1 level)의 일상적인 어휘를 사용하세요.
+            """       
+
+# ==========================================================
+        # 🧠 [순수 어휘 난이도 스위칭 로직] 아주 강력한 강제 지시문
+        # ==========================================================
+        stage_clean = str(stage_id).lower().strip().replace(" ", "_")
+        
+        # 🟢 [쉬움] Stage 1, 2
+        if stage_clean in ["stage_1", "stage_2"]:
+            difficulty_instruction = """
+            [System Directive: VERY EASY English Mode (STRICT)]
+            - 규칙 1: 무조건 초등학교 1학년 수준의 아주 쉬운 단어(A1 레벨)만 사용하세요.
+            - 규칙 2: 한 문장은 최대한 짧게(7단어 이하) 끊어서 말하세요. 숙어나 은유법은 절대 금지합니다.
+            - 규칙 3: 호감도에 따른 플러팅이나 감정 표현을 하더라도, 반드시 '가장 기초적인 영단어'로만 해야 합니다.
+            """
+        # 🔴 [어려움] Stage 7, 8, 보너스 후반
+        elif stage_clean in ["stage_7", "stage_8", "bonus_2", "bonus_stage_2"]:
+            difficulty_instruction = """
+            [System Directive: HIGHLY ADVANCED English Mode (STRICT)]
+            - 규칙 1: 무조건 토플/GRE 수준의 최고급 어휘(C1/C2 레벨)와 복잡한 숙어(Idiom)를 2개 이상 섞어서 말하세요.
+            - 규칙 2: 문장 구조를 복잡하고 길게 만들고, 시적이고 문학적인 은유를 적극 사용하세요.
+            - 규칙 3: 호감도에 따른 플러팅이나 감정 표현을 하더라도, 원어민들도 감탄할 만큼 지적이고 수준 높은 '고급진 영단어'로 묘사해야 합니다. 평범한 단어 사용은 금지합니다.
+            """
+        # 🟡 [중간] Stage 3, 4, 5, 6, 보너스 초반
+        else:
+             difficulty_instruction = """
+            [System Directive: Medium English Mode]
+            - 규칙: 일상적인 중급 영어(B1/B2 레벨)와 자연스러운 원어민 구어체를 사용하세요.
+            """
+
         base_prompt = await self.get_character_prompt(char_id)
         summary_prefix = f"[PAST CONVERSATION SUMMARY]\n{current_summary}\n\n" if current_summary else ""
-        system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Input Mode: is_video_call={is_video_call}"
         
+        
+        system_prompt = summary_prefix + base_prompt + "\n\n" + difficulty_instruction + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Input Mode: is_video_call={is_video_call}"
         messages = [{"role": "system", "content": system_prompt}]
         
         # GPT history 클리닝 처리 (JSON 문자열 대신 퓨어 텍스트만 전달하여 챗봇 응답 안정성 확보)
