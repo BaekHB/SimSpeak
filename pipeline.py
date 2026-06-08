@@ -62,12 +62,10 @@ class SimSpeakAIPipeline:
         print(f" ⏳ [ASYNC TRACK START] User '{user_id}' - Downloading audio via HTTPX...")
         
         try:
-            # httpx를 활용한 비동기 오디오 스트림 다운로드
             async with httpx.AsyncClient() as client:
                 response = await client.get(audio_url, timeout=15.0)
                 if response.status_code != 200: return whisper_text, error_response
                 
-                # 디스크 쓰기 비동기 최적화
                 async with aiofiles.open(temp_eval_path, "wb") as f:
                     await f.write(response.content)
 
@@ -91,7 +89,7 @@ class SimSpeakAIPipeline:
             except Exception as e:
                 print(f" ❌ [WHISPER ERROR] User '{user_id}' - {e}")
 
-            # Track 2: Azure Speech (SDK 차단 연산을 별도 워커 스레드 풀로 완벽하게 격리)
+            # Track 2: Azure Speech SDK
             detailed_score = error_response
             try:
                 def run_speech_assessment():
@@ -111,11 +109,9 @@ class SimSpeakAIPipeline:
                     speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, language="en-US", audio_config=audio_config)
                     pronunciation_config.apply_to(speech_recognizer)
                     
-                    # 동기 차단성 SDK 호출
                     result = speech_recognizer.recognize_once_async().get()
                     return result
 
-                # 메인 루프를 멈추지 않고 비동기 백그라운드 스레드에서 처리
                 result = await asyncio.to_thread(run_speech_assessment)
                 
                 if result.reason == speechsdk.ResultReason.RecognizedSpeech:
@@ -127,7 +123,6 @@ class SimSpeakAIPipeline:
                             "accuracy": int(word.accuracy_score),
                             "error_type": word.error_type if word.error_type != "None" else None
                         })
-                    # ERD 기준에 따라 세부 단어 리스트 Key 명칭을 word_details_json으로 빌드
                     detailed_score = {
                         "accuracy": int(assessment_result.accuracy_score),
                         "fluency": int(assessment_result.fluency_score),
@@ -149,6 +144,9 @@ class SimSpeakAIPipeline:
                 except: pass
 
     async def generate_tts(self, user_id: str, character_id: str, text_content: str) -> str:
+        if not text_content or text_content.strip() == "":
+            return "https://9aifinalteam4.blob.core.windows.net/audio-files/reply_8e9e195b.mp3"
+            
         temp_filename = f"reply_{uuid.uuid4().hex[:8]}.mp3"
         print(f" ⏳ [ASYNC TTS START] User '{user_id}' - Generating Azure TTS in worker thread...")
         try:
@@ -158,10 +156,8 @@ class SimSpeakAIPipeline:
                 synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
                 synthesizer.speak_ssml_async(self.make_ssml(character_id, text_content)).get()
 
-            # Azure TTS 차단 연산 해결
             await asyncio.to_thread(run_tts_synthesis)
 
-            # Storage 업로드 IO 분리
             def upload_to_blob():
                 blob_service_client = BlobServiceClient.from_connection_string(self.storage_connection)
                 blob_client = blob_service_client.get_blob_client(container="audio-files", blob=temp_filename)
@@ -181,7 +177,6 @@ class SimSpeakAIPipeline:
                 except: pass
 
     async def get_character_prompt(self, character_id: str) -> str:
-        # 파일 읽기 비동기화
         async with aiofiles.open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: 
             return await f.read()
 
@@ -205,88 +200,128 @@ class SimSpeakAIPipeline:
             messages.append({"role": turn.get("role"), "content": turn.get("content")})
         messages.append({"role": "user", "content": user_text})
 
-        try:
-            print(f" 🧠 [ASYNC LLM CALL] User '{user_id}' - Requesting AsyncAzureOpenAI...")
-            ai_client = AsyncAzureOpenAI(azure_endpoint=self.openai_endpoint, api_key=self.openai_key, api_version="2024-02-15-preview")
-            response = await ai_client.chat.completions.create(model=self.openai_deployment, response_format={"type": "json_object"}, messages=messages)
-            
-            ai_result = json.loads(response.choices[0].message.content)
-            print(f" 🎉 [ASYNC LLM SUCCESS] User '{user_id}' - LLM generation finished.")
-            
-            user_data["history"].append({"role": "user", "content": user_text})
-            user_data["history"].append({"role": "assistant", "content": response.choices[0].message.content})
-            user_data["current_affinity"] = max(0, min(100, user_data["current_affinity"] + ai_result.get("affinity_delta", 0)))
+        ai_result = None
+        max_retries = 3
+        retry_count = 0
+        
+        # --- [오류 복구 가드 루프 레이어 탑재] ---
+        while retry_count < max_retries:
+            try:
+                print(f" 🧠 [ASYNC LLM CALL] User '{user_id}' - Requesting AsyncAzureOpenAI (Try {retry_count + 1}/{max_retries})...")
+                ai_client = AsyncAzureOpenAI(azure_endpoint=self.openai_endpoint, api_key=self.openai_key, api_version="2024-02-15-preview")
+                response = await ai_client.chat.completions.create(model=self.openai_deployment, response_format={"type": "json_object"}, messages=messages)
+                
+                raw_content = response.choices[0].message.content
+                if not raw_content or raw_content.strip() == "":
+                    raise ValueError("LLM이 텅 빈 응답을 리턴했습니다.")
+                    
+                parsed_json = json.loads(raw_content)
+                
+                # 필수 뼈대 필드가 누락되었는지 정밀 검증
+                if "text_content" not in parsed_json or "action_description" not in parsed_json:
+                    raise KeyError("필수 출력 키값(text_content 또는 action_description)이 누락되었습니다.")
+                if "system_evaluation" not in parsed_json:
+                    parsed_json["system_evaluation"] = {}
+                
+                # 검증에 완벽히 통과하면 루프 탈출
+                ai_result = parsed_json
+                print(f" 🎉 [ASYNC LLM SUCCESS] User '{user_id}' - LLM generation verified on Try {retry_count + 1}.")
+                break
+                
+            except (json.JSONDecodeError, KeyError, ValueError, Exception) as error_ex:
+                retry_count += 1
+                print(f" ⚠️ [LLM FORMAT ERROR] User '{user_id}' - 포맷 오류 감지 (회차: {retry_count}): {error_ex}")
+                
+                if retry_count < max_retries:
+                    # LLM에게 규격을 다시 지키라고 경고 피드백을 주입하여 보정 재시도 유도
+                    messages.append({
+                        "role": "system", 
+                        "content": "[SYSTEM WARNING] 반환된 출력 포맷이 손상되었거나 지정된 Key가 누락되었습니다. 마크다운을 떼고 명세된 스펙의 순수 JSON 포맷으로만 다시 정확히 답변해 주세요."
+                    })
+                    await asyncio.sleep(0.5)  # 짧은 간격 지연 후 재요청
+                else:
+                    print(f" 🚨 [LLM RETRY EXCEEDED] User '{user_id}' - 최대 재시도 횟수를 초과했습니다. 비상 Fallback 데이터셋을 배포합니다.")
 
-            # 비동기 TTS 구동 및 바인딩
-            ai_result["audio_url"] = await self.generate_tts(user_id, char_id, ai_result.get("text_content", ""))
-            ai_result["current_total_affinity"] = user_data["current_affinity"]
-            ai_result["user_recognized_text"] = user_text
-            
-            # --- ERD 기준 매핑에 따른 데이터 Key 변환 레이어 시작 ---
-            if "system_evaluation" not in ai_result: ai_result["system_evaluation"] = {}
-            
-            # 1. corrections -> corrections_json 명칭 스위칭 보정
-            if "corrections" in ai_result["system_evaluation"]:
-                ai_result["system_evaluation"]["corrections_json"] = ai_result["system_evaluation"].pop("corrections")
-            
-            if "corrections_json" not in ai_result["system_evaluation"] or not ai_result["system_evaluation"]["corrections_json"]:
-                ai_result["system_evaluation"]["corrections_json"] = [
-                    {"original_sentence": "Hey, 자기야. I was so 감동했어.", "corrected_sentence": "Hey, honey. I was so touched."},
-                    {"original_sentence": "you're truly my 최고야.", "corrected_sentence": "you're truly my best."}
-                ]
-
-            fallback_ipa_map = {
-                "hey": "[heɪ]", "truly": "[ˈtruːli]", "i": "[aɪ]",
-                "was": "[wʌz]", "so": "[soʊ]", "text": "[tekst]", "my": "[maɪ]"
+        # 최후의 보루: 3회 재시도가 모두 실패할 경우 서버 크래시를 차단하고 안전한 더미 데이터 조립
+        if ai_result is None:
+            ai_result = {
+                "text_content": "Oh, sorry! I got a bit distracted for a second. What were you saying, love?" if char_id == "liam" else "Oh, sorry! I got distracted. What were you saying?",
+                "action_description": "어색한 듯 머리를 긁적이며 여유롭게 웃어 보인다.",
+                "affinity_delta": 0,
+                "system_notification": "",
+                "is_active": True,
+                "system_evaluation": {
+                    "is_penalty": False,
+                    "grammar_feedback": "시스템 응답이 지연되어 실시간 문법 피드백을 로드하지 못했습니다.",
+                    "corrections_json": [],
+                    "pronunciation_evaluations": None,
+                    "pronunciation_feedback": None
+                }
             }
 
-            # 2. pronunciation_score -> pronunciation_evaluations 명칭 스위칭 및 내부 word_details 가이드 맵핑
-            if real_pronunciation_evaluations and len(real_pronunciation_evaluations.get("word_details_json", [])) > 0:
-                gpt_details = ai_result.get("system_evaluation", {}).get("pronunciation_score", {}).get("word_details", []) or []
+        # 가상 세션에 대화 히스토리 및 호감도 누적 반영
+        user_data["history"].append({"role": "user", "content": user_text})
+        user_data["history"].append({"role": "assistant", "content": json.dumps(ai_result, ensure_ascii=False)})
+        user_data["current_affinity"] = max(0, min(100, user_data["current_affinity"] + ai_result.get("affinity_delta", 0)))
+
+        # 비동기 TTS 구동 및 바인딩
+        ai_result["audio_url"] = await self.generate_tts(user_id, char_id, ai_result.get("text_content", ""))
+        ai_result["current_total_affinity"] = user_data["current_affinity"]
+        ai_result["user_recognized_text"] = user_text
+        
+        # --- ERD 기준 매핑에 따른 데이터 Key 최종 정제 보증 레이어 ---
+        gpt_eval = ai_result.get("system_evaluation", {})
+        if not isinstance(gpt_eval, dict):
+            gpt_eval = {}
+            ai_result["system_evaluation"] = gpt_eval
+
+        # 1. corrections -> corrections_json 명칭 변경 스위칭
+        if "corrections" in gpt_eval:
+            gpt_eval["corrections_json"] = gpt_eval.pop("corrections")
+        if "corrections_json" not in gpt_eval or not gpt_eval["corrections_json"]:
+            gpt_eval["corrections_json"] = []
+
+        fallback_ipa_map = {
+            "hey": "[heɪ]", "truly": "[ˈtruːli]", "i": "[aɪ]",
+            "was": "[wʌz]", "so": "[soʊ]", "text": "[tekst]", "my": "[maɪ]"
+        }
+
+        # 2. pronunciation_score -> pronunciation_evaluations 명칭 스위칭 및 내부 가이드 매핑
+        if "pronunciation_score" in gpt_eval:
+            gpt_eval.pop("pronunciation_score")
+
+        if real_pronunciation_evaluations and len(real_pronunciation_evaluations.get("word_details_json", [])) > 0:
+            for word_obj in real_pronunciation_evaluations.get("word_details_json", []):
+                acc = word_obj.get("accuracy", 0)
+                w_lower = word_obj["word"].lower().replace(",", "").replace(".", "")
                 
-                for word_obj in real_pronunciation_evaluations.get("word_details_json", []):
-                    acc = word_obj.get("accuracy", 0)
-                    w_lower = word_obj["word"].lower().replace(",", "").replace(".", "")
-                    
-                    if "my_pronunciation" in word_obj:
-                        del word_obj["my_pronunciation"]
-                    
-                    if acc >= 75:
+                if "my_pronunciation" in word_obj:
+                    del word_obj["my_pronunciation"]
+                
+                if acc >= 75:
+                    word_obj["guide"] = ""
+                else:
+                    if w_lower in fallback_ipa_map:
+                        word_obj["guide"] = fallback_ipa_map[w_lower]
+                    else:
                         word_obj["guide"] = ""
-                    else:
-                        matching_gpt_word = next((w for w in gpt_details if w.get("word", "").lower() == w_lower), None)
-                        g_val = matching_gpt_word.get("guide", "") if matching_gpt_word else ""
-                        
-                        if not g_val and w_lower in fallback_ipa_map:
-                            g_val = fallback_ipa_map[w_lower]
-                            
-                        word_obj["guide"] = g_val if (g_val.startswith("[") or not g_val) else f"[{g_val}]"
-                
-                # 가이드 맵핑 완료된 객체를 최종 ERD 테이블명에 맞춰 주입 (기존 pronunciation_score 필드는 제거)
-                if "pronunciation_score" in ai_result["system_evaluation"]:
-                    ai_result["system_evaluation"].pop("pronunciation_score")
-                ai_result["system_evaluation"]["pronunciation_evaluations"] = real_pronunciation_evaluations
-                
-                feedback_text = ai_result.get("system_evaluation", {}).get("pronunciation_feedback", "")
-                if not feedback_text or len(feedback_text.strip()) < 5:
-                    fluency_val = real_pronunciation_evaluations.get("fluency", 0)
-                    accuracy_val = real_pronunciation_evaluations.get("accuracy", 0)
-                    
-                    if accuracy_val >= 85 and fluency_val >= 80:
-                        feedback_text = "전반적으로 단어의 정확한 발음은 물론, 문장의 자연스러운 억양과 연결음 구사력이 매우 훌륭합니다. 원어민에 가까운 리듬감과 유창성을 유지하고 있어 훌륭한 전달력을 보여주고 있습니다."
-                    elif accuracy_val >= 80 and fluency_val < 70:
-                        feedback_text = "단어 각각의 정확도는 매우 높은 편이며 억양 구사력도 안정적입니다. 다만, 단어와 단어 사이를 매끄럽게 잇지 못하고 다소 주저하거나 끊어 읽는 패턴이 확인되니 조금 더 덩어리(Chunk) 단위로 이어서 말하는 연습을 추천합니다."
-                    else:
-                        feedback_text = "연결음을 부드럽게 구사하여 문장을 끊김 없이 이어 말하는 장점이 있습니다. 다만 특정 단어에서 자음 발음이 약화되거나 개별 음소의 정확도가 흔들리는 경향이 있으니 발음 가이드를 참고하여 보완해 보세요."
-                
-                ai_result["system_evaluation"]["pronunciation_feedback"] = feedback_text
-            else:
-                if "pronunciation_score" in ai_result["system_evaluation"]:
-                    ai_result["system_evaluation"].pop("pronunciation_score")
-                ai_result["system_evaluation"]["pronunciation_evaluations"] = None
-                ai_result["system_evaluation"]["pronunciation_feedback"] = None
             
-            return ai_result
-        except Exception as e:
-            print(f" ❌ [RUN CRITICAL ERROR] User '{user_id}' - {e}")
-            raise e
+            gpt_eval["pronunciation_evaluations"] = real_pronunciation_evaluations
+            
+            feedback_text = gpt_eval.get("pronunciation_feedback", "")
+            if not feedback_text or len(feedback_text.strip()) < 5:
+                fluency_val = real_pronunciation_evaluations.get("fluency", 0)
+                accuracy_val = real_pronunciation_evaluations.get("accuracy", 0)
+                
+                if accuracy_val >= 85 and fluency_val >= 80:
+                    feedback_text = "전반적으로 단어의 정확한 발음은 물론, 문장의 자연스러운 억양과 연결음 구사력이 매우 훌륭합니다."
+                elif accuracy_val >= 80 and fluency_val < 70:
+                    feedback_text = "단어 각각의 정확도는 높은 편이나 단어 사이를 매끄럽게 잇지 못하니 덩어리(Chunk) 단위로 말하는 연습을 추천합니다."
+                else:
+                    feedback_text = "연결음을 부드럽게 구사하는 장점이 있으나 개별 음소의 정확도가 흔들리는 경향이 있으니 발음 가이드를 참고해 보세요."
+            gpt_eval["pronunciation_feedback"] = feedback_text
+        else:
+            gpt_eval["pronunciation_evaluations"] = None
+            gpt_eval["pronunciation_feedback"] = None
+        
+        return ai_result
