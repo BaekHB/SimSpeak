@@ -42,30 +42,35 @@ class SimSpeakAIPipeline:
                     raise e
 
     def make_ssml(self, character_id: str, text_content: str) -> str:
+        import re
         char_id = character_id.lower()
-        voice_name = "en-US-ChristopherNeural"
+        voice_name = "en-US-AndrewMultilingualNeural"
         rate, pitch = "0%", "0%"
         
         if char_id == "liam":
-            voice_name = "en-GB-RyanNeural"
+            voice_name = "en-GB-OllieMultilingualNeural"
             rate, pitch = "-10%", "-5%"
         elif char_id == "chloe":
-            voice_name = "en-US-AriaNeural"
+            voice_name = "en-US-AvaMultilingualNeural"
             rate, pitch = "+10%", "+5%"
         elif char_id == "ian":
-            voice_name = "en-US-ChristopherNeural"
+            voice_name = "en-US-AndrewMultilingualNeural"
         elif char_id == "june":
-            voice_name = "en-AU-WilliamNeural"
+            voice_name = "en-AU-WilliamMultilingualNeural"
         elif char_id == "sienna":
-            voice_name = "en-GB-SoniaNeural"
+            voice_name = "en-GB-AdaMultilingualNeural"
         elif char_id == "yoon":
-            voice_name = "en-AU-NatashaNeural"
+            voice_name = "en-US-EmmaMultilingualNeural"
+            
+        # Korean text detection and wrapping with lang tag
+        pattern = re.compile(r'([\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]+(?:\s+[\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]+)*)')
+        wrapped_text = pattern.sub(r'<lang xml:lang="ko-KR">\1</lang>', text_content)
             
         return f"""
         <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">
             <voice name="{voice_name}">
                 <prosody rate="{rate}" pitch="{pitch}">
-                    {text_content}
+                    {wrapped_text}
                 </prosody>
             </voice>
         </speak>
@@ -80,15 +85,18 @@ class SimSpeakAIPipeline:
         print(f" ⏳ [ASYNC TRACK START] User '{user_id}' - Downloading audio via HTTPX...")
         
         try:
+            # httpx를 활용한 비동기 오디오 스트림 다운로드
             async with httpx.AsyncClient() as client:
                 response = await client.get(audio_url, timeout=15.0)
                 if response.status_code != 200: return whisper_text, error_response
                 
+                # 디스크 쓰기 비동기 최적화
                 async with aiofiles.open(temp_eval_path, "wb") as f:
                     await f.write(response.content)
 
             print(f" 🚀 [ASYNC FLOW] User '{user_id}' - Audio download complete. Running Whisper & Speech Evaluation...")
 
+            # Track 1: Whisper 비동기 클라이언트 호출
             try:
                 whisper_client = AsyncAzureOpenAI(
                     azure_endpoint=self.whisper_endpoint, 
@@ -99,13 +107,15 @@ class SimSpeakAIPipeline:
                     whisper_result = await whisper_client.audio.transcriptions.create(
                         file=audio_file, 
                         model=self.whisper_deployment, 
-                        prompt="Hello! 안녕하세요."
+                        prompt="Hello! 안녕하세요.",
+                        language="en"
                     )
                 whisper_text = whisper_result.text
                 print(f" 🔍 [ASYNC FLOW] User '{user_id}' - Whisper Text Extracted: '{whisper_text}'")
             except Exception as e:
                 print(f" ❌ [WHISPER ERROR] User '{user_id}' - {e}")
 
+            # Track 2: Azure Speech (SDK 차단 연산을 별도 워커 스레드 풀로 완벽하게 격리)
             detailed_score = error_response
             try:
                 def run_speech_assessment():
@@ -126,19 +136,23 @@ class SimSpeakAIPipeline:
                     speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, language="en-US", audio_config=audio_config)
                     pronunciation_config.apply_to(speech_recognizer)
                     
+                    # 동기 차단성 SDK 호출
                     result = speech_recognizer.recognize_once_async().get()
                     return result
 
+                # 메인 루프를 멈추지 않고 비동기 백그라운드 스레드에서 처리
                 result = await asyncio.to_thread(run_speech_assessment)
                 
                 if result.reason == speechsdk.ResultReason.RecognizedSpeech:
                     assessment_result = speechsdk.PronunciationAssessmentResult(result)
                     word_details_list = []
                     for word in assessment_result.words:
+                        # 네이티브 IPA 자모들을 하나의 단어 가이드 발음기호로 합성
                         ipa_guide = ""
                         if word.phonemes:
                             ipa_guide = f"[{''.join(p.phoneme for p in word.phonemes)}]"
                             
+                        # 단어 평가 75점 미만일 때만 guide 필드에 발음 기호를 주입하고, 그 외에는 공백("") 처리
                         guide = ipa_guide if word.accuracy_score < 75 else ""
                         
                         word_details_list.append({
@@ -180,8 +194,10 @@ class SimSpeakAIPipeline:
                 synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
                 synthesizer.speak_ssml_async(self.make_ssml(character_id, text_content)).get()
 
+            # Azure TTS 차단 연산 해결
             await asyncio.to_thread(run_tts_synthesis)
 
+            # Storage 업로드 IO 분리
             def upload_to_blob():
                 blob_service_client = BlobServiceClient.from_connection_string(self.storage_connection)
                 blob_client = blob_service_client.get_blob_client(container="audio-files", blob=temp_filename)
@@ -201,6 +217,7 @@ class SimSpeakAIPipeline:
                 except: pass
 
     async def get_character_prompt(self, character_id: str) -> str:
+        # 파일 읽기 비동기화
         async with aiofiles.open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: 
             return await f.read()
 
@@ -220,12 +237,14 @@ class SimSpeakAIPipeline:
             extracted_text, real_pronunciation_evaluations = await self.evaluate_dual_track(user_id, user_audio_url)
             if extracted_text: user_text = extracted_text
 
+        # AsyncAzureOpenAI 인스턴스 미리 생성
         ai_client = AsyncAzureOpenAI(
             azure_endpoint=self.openai_endpoint,
             api_key=self.openai_key,
             api_version="2024-02-15-preview"
         )
 
+        # [토큰 절약 엔진 가동] 10턴 초과 시 압축 로그 작동
         if len(user_data["history"]) > 10:
             overflow_turns = user_data["history"][:-10]
             overflow_text = ""
@@ -249,43 +268,27 @@ class SimSpeakAIPipeline:
             except Exception as e:
                 print(f"[Warning] Summary engine temporary error: {e}")
 
-        # ==========================================================
-        # 🧠 [자동 난이도 스위칭 로직] stage_id 기반 가이드라인 빌드
-        # ==========================================================
-        stage_clean = str(stage_id).lower().strip().replace(" ", "_")
-        
-        # 🟢 [쉬움] Stage 1, 2
-        if stage_clean in ["stage_1", "stage_2"]:
-            difficulty_instruction = """
-            [System Directive: VERY EASY English Mode (STRICT)]
-            - 규칙 1: 무조건 초등학교 1학년 수준의 아주 쉬운 단어(A1 레벨)만 사용하세요.
-            - 규칙 2: 한 문장은 최대한 짧게(7단어 이하) 끊어서 말하세요. 숙어나 은유법은 절대 금지합니다.
-            - 규칙 3: 호감도에 따른 플러팅이나 감정 표현을 하더라도, 반드시 '가장 기초적인 영단어'로만 해야 합니다.
-            - 성격(호구 모드): 유저의 말에 매우 호의적이고 긍정적으로 리액션하며, 제안을 흔쾌히 수락하고 자신감을 북돋아 주며 친절하게 대하세요.
-            """
-        # 🔴 [어려움] Stage 7, 8, 보너스 후반
-        elif stage_clean in ["stage_7", "stage_8", "bonus_2", "bonus_stage_2"]:
-            difficulty_instruction = """
-            [System Directive: HIGHLY ADVANCED English Mode (STRICT)]
-            - 규칙 1: 무조건 토플/GRE 수준의 최고급 어휘(C1/C2 레벨)와 복잡한 숙어(Idiom)를 2개 이상 섞어서 말하세요.
-            - 규칙 2: 문장 구조를 복잡하고 길게 만들고, 시적이고 문학적인 은유를 적극 사용하세요.
-            - 규칙 3: 호감도에 따른 플러팅이나 감정 표현을 하더라도, 원어민들도 감탄할 만큼 지적이고 수준 높은 '고급진 영단어'로 묘사해야 합니다. 평범한 단어 사용은 금지합니다.
-            - 성격(철벽 모드): 유저의 제안, 부탁, 질문에 매우 방어적이고 까다롭게 반응하세요. 쉽게 동의하지 말고 유저가 더 구체적이고 논리적인 답변을 하도록 유도하세요.
-            """
-        # 🟡 [중간] Stage 3, 4, 5, 6, 보너스 초반 (그 외 전부)
-        else:
-            difficulty_instruction = """
-            [System Directive: Medium English Mode]
-            - 규칙: 일상적인 중급 영어(B1/B2 레벨)와 자연스러운 원어민 구어체를 사용하세요.
-            - 성격: 약간의 의심을 가지거나 밀당을 하지만, 유저가 타당한 이유를 대면 자연스럽게 호응해 줍니다.
-            """
-
         base_prompt = await self.get_character_prompt(char_id)
         summary_prefix = f"[PAST CONVERSATION SUMMARY]\n{current_summary}\n\n" if current_summary else ""
         
-        system_prompt = summary_prefix + base_prompt + "\n\n" + difficulty_instruction + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Input Mode: is_video_call={is_video_call}"
+        recovery_rule = """
+[CRITICAL RULE: STT Homophone & Contextual Recovery]
+- Since the user's input is transcribed via STT, Korean mixed words spoken by the user may be transcribed as phonetically similar English words or direct translations (e.g., when the user says "화이팅", the STT transcript shows "fighting").
+- Contextually deduce the user's original Korean-mixed intent from the conversation flow.
+- In your reply (text_content), do not translate these words; instead, use the original Hangul words in your response if you decide to code-switch (e.g., "화이팅").
+
+[SITUATIONAL NATIVE CORRECTION PRINCIPLE]
+- Identify any Konglish, literal translations of Korean idioms/expressions, or Korean loanwords in the user's input.
+- Analyze the user's current situation, emotional state, and conversation context.
+- Recommend the most natural native English equivalent (such as context-appropriate idioms, phrasal verbs, or situational expressions) that native speakers would use in that exact scenario.
+- In corrected_sentence, provide the fully corrected sentence containing this natural expression.
+- In grammar_feedback, explain why the recommended expression fits their current situation/emotion perfectly in friendly Korean, explaining the nuanced difference.
+"""
+        system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Input Mode: is_video_call={is_video_call}\n\n{recovery_rule}"
+        
         messages = [{"role": "system", "content": system_prompt}]
         
+        # GPT history 클리닝 처리 (JSON 문자열 대신 퓨어 텍스트만 전달하여 챗봇 응답 안정성 확보)
         refined_history = []
         for turn in user_data["history"]:
             role = turn.get("role")
@@ -311,6 +314,7 @@ class SimSpeakAIPipeline:
         raw_usage_data = {}
         last_response_text = ""
 
+        # --- [오류 복구 가드 루프 레이어 탑재] ---
         while retry_count < max_retries:
             try:
                 print(f" 🧠 [ASYNC LLM CALL] User '{user_id}' - Requesting AsyncAzureOpenAI (Try {retry_count + 1}/{max_retries})...")
@@ -327,6 +331,7 @@ class SimSpeakAIPipeline:
                     
                 parsed_json = json.loads(last_response_text)
                 
+                # 필수 출력 키값(text_content 또는 action_description) 검증
                 if "text_content" not in parsed_json or "action_description" not in parsed_json:
                     raise KeyError("필수 출력 키값(text_content 또는 action_description)이 누락되었습니다.")
                 if "system_evaluation" not in parsed_json:
@@ -334,6 +339,7 @@ class SimSpeakAIPipeline:
                 
                 ai_result = parsed_json
                 
+                # 대표님 보고용 토큰 및 원본 생로그 추출
                 raw_usage_data = {
                     "usage": response.usage.model_dump() if hasattr(response, "usage") and response.usage else {},
                     "model": response.model,
@@ -348,21 +354,23 @@ class SimSpeakAIPipeline:
                 print(f" ⚠️ [LLM FORMAT ERROR] User '{user_id}' - 포맷 오류 감지 (회차: {retry_count}): {error_ex}")
                 
                 if retry_count < max_retries:
+                    # LLM에게 규격을 다시 지키라고 경고 피드백을 주입하여 보정 재시도 유도
                     messages.append({
                         "role": "system", 
                         "content": "[SYSTEM WARNING] 반환된 출력 포맷이 손상되었거나 지정된 Key가 누락되었습니다. 마크다운을 떼고 명세된 스펙의 순수 JSON 포맷으로만 다시 정확히 답변해 주세요."
                     })
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.5)  # 짧은 간격 지연 후 재요청
                 else:
                     print(f" 🚨 [LLM RETRY EXCEEDED] User '{user_id}' - 최대 재시도 횟수를 초과했습니다. 비상 Fallback 데이터셋을 배포합니다.")
 
+        # 최후의 보루: 3회 재시도가 모두 실패할 경우 서버 크래시를 차단하고 안전한 더미 데이터 조립
         if ai_result is None:
             ai_result = {
                 "text_content": "Oh, sorry! I got a bit distracted for a second. What were you saying, love?" if char_id == "liam" else "Oh, sorry! I got distracted. What were you saying?",
                 "action_description": "어색한 듯 머리를 긁적이며 여유롭게 웃어 보인다.",
                 "affinity_delta": 0,
                 "system_notification": "",
-                "is_active": true,
+                "is_active": True,
                 "system_evaluation": {
                     "is_penalty": False,
                     "grammar_feedback": "시스템 응답이 지연되어 실시간 문법 피드백을 로드하지 못했습니다.",
@@ -387,7 +395,8 @@ class SimSpeakAIPipeline:
             ))
             korean_ratio = korean_word_count / len(words)
 
-        threshold = 0.30
+        stage_clean = str(stage_id).lower().strip().replace(" ", "_")
+        threshold = 0.30  # 기본값
         if stage_clean in ["stage_1", "stage_2"]:
             threshold = 0.30
         elif stage_clean in ["stage_3", "stage_4", "stage_5", "stage_6", "bonus_1", "bonus_stage_1"]:
@@ -408,9 +417,11 @@ class SimSpeakAIPipeline:
 
         if "system_evaluation" not in ai_result: ai_result["system_evaluation"] = {}
         
+        # 1. corrections -> corrections_json 명칭 스위칭 보정
         if "corrections" in ai_result["system_evaluation"]:
             ai_result["system_evaluation"]["corrections_json"] = ai_result["system_evaluation"].pop("corrections")
         
+        # (1) corrections_json 리스트가 비어 있거나 없을 시 디폴트 원어민 교정 문장 fallback 주입
         if "corrections_json" not in ai_result["system_evaluation"] or not ai_result["system_evaluation"]["corrections_json"]:
             ai_result["system_evaluation"]["corrections_json"] = [
                 {
@@ -419,9 +430,11 @@ class SimSpeakAIPipeline:
                 }
             ]
 
+        # 비동기 TTS 구동 및 바인딩 (보이스 모드일 때는 AI 답변과 문법 교정문(corrected_sentence) 가이드를 병렬로 가동하여 대기 시간 최적화)
         if user_audio_url:
             ai_audio_task = self.generate_tts(user_id, char_id, ai_result.get("text_content", ""))
             
+            # corrections_json의 각 corrected_sentence에 대한 TTS 생성 태스크 리스트 구축
             corrections_list = ai_result["system_evaluation"]["corrections_json"]
             tts_tasks = []
             for corr in corrections_list:
@@ -432,6 +445,7 @@ class SimSpeakAIPipeline:
                     async def dummy_none(): return None
                     tts_tasks.append(dummy_none())
             
+            # 병렬 합성 가동
             results = await asyncio.gather(ai_audio_task, *tts_tasks)
             
             ai_result["audio_url"] = results[0]
@@ -440,6 +454,7 @@ class SimSpeakAIPipeline:
                 corr["corrected_audio_url"] = url
         else:
             ai_result["audio_url"] = await self.generate_tts(user_id, char_id, ai_result.get("text_content", ""))
+            # 텍스트 모드에서는 가이드 음성을 생성하지 않고 None으로 채웁니다.
             corrections_list = ai_result["system_evaluation"]["corrections_json"]
             for corr in corrections_list:
                 corr["corrected_audio_url"] = None
@@ -453,6 +468,7 @@ class SimSpeakAIPipeline:
         }
 
         if real_pronunciation_evaluations and len(real_pronunciation_evaluations.get("word_details_json", [])) > 0:
+            # 2. GPT가 작성한 기존 pronunciation_score 필드가 있다면 제거하고 pronunciation_evaluations로 통합 적용
             gpt_details = []
             if "pronunciation_score" in ai_result["system_evaluation"]:
                 gpt_details = ai_result["system_evaluation"].pop("pronunciation_score", {}).get("word_details", []) or []
@@ -467,6 +483,7 @@ class SimSpeakAIPipeline:
                 if acc >= 75:
                     word_obj["guide"] = ""
                 else:
+                    # 이미 evaluate_dual_track에서 주입된 네이티브 IPA 가이드가 있는지 우선 확인
                     g_val = word_obj.get("guide", "")
                     
                     if not g_val:
