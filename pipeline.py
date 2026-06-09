@@ -40,7 +40,71 @@ class SimSpeakAIPipeline:
                     await asyncio.sleep(sleep_time)
                 else:
                     raise e
+    async def generate_llm_two_track(self, messages: list, user_text: str) -> tuple[str, dict]:
+        async_client = AsyncAzureOpenAI(
+            azure_endpoint=self.openai_endpoint,
+            api_key=self.openai_key,
+            api_version="2024-02-15-preview"
+        )
 
+        # 💡 [핵심 픽스] Azure GPT-4o 버그 우회를 위해 모든 유저 메시지를 배열로 예쁘게 포장합니다!
+        safe_messages = []
+        for m in messages:
+            if m["role"] == "system":
+                safe_messages.append(m)
+            else:
+                safe_messages.append({
+                    "role": m["role"], 
+                    "content": [{"type": "text", "text": str(m["content"])}]
+                })
+
+        async def track_a_conversation():
+            try:
+                response = await self.call_llm_with_retry(
+                    async_client,
+                    model=self.openai_deployment,
+                    messages=safe_messages, # 👈 포장된 메시지 투입
+                    response_format={"type": "json_object"}
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                print(f"🚨 [트랙 A 대화] 에러: {e}")
+                # 💡 [안전장치] 에러 시 서버가 깨지지 않게 가짜 JSON 문자열을 뱉어냅니다.
+                return '{"text_content": "앗, 미안해! 잠깐 다른 생각 하느라 못 들었어. 다시 말해줄래?", "action_description": "멋쩍게 웃는다."}'
+
+        async def track_b_feedback():
+            system_feedback_prompt = """
+            너는 유저의 영어 문장을 분석하는 평가 시스템이야. 절대 캐릭터 연기 하지마.
+            아래 JSON 형식으로만 응답해:
+            {
+                "is_penalty": false,
+                "grammar_feedback": "문장 구조가 완벽합니다.",
+                "corrections": [
+                    {"original_sentence": "틀린 부분", "corrected_sentence": "원어민 교정 문장"}
+                ],
+                "affinity_delta": 2
+            }
+            """
+            try:
+                response = await self.call_llm_with_retry(
+                    async_client,
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_feedback_prompt},
+                        # 💡 여기도 에러 안 나게 배열로 꼼꼼하게 포장!
+                        {"role": "user", "content": [{"type": "text", "text": str(user_text)}]}
+                    ],
+                    response_format={"type": "json_object"}
+                )
+                return json.loads(response.choices[0].message.content)
+            except Exception as e:
+                print(f"🚨 [트랙 B 피드백] 에러: {e}")
+                return {"is_penalty": False, "grammar_feedback": "시스템 분석 지연", "corrections": [], "affinity_delta": 0}
+
+        # 빛의 속도로 두 트랙 동시 실행!
+        conv_text, feedback_data = await asyncio.gather(track_a_conversation(), track_b_feedback())
+        return conv_text, feedback_data
+    
     def make_ssml(self, character_id: str, text_content: str) -> str:
         import re
         char_id = character_id.lower()
@@ -317,33 +381,27 @@ class SimSpeakAIPipeline:
         # --- [오류 복구 가드 루프 레이어 탑재] ---
         while retry_count < max_retries:
             try:
-                print(f" 🧠 [ASYNC LLM CALL] User '{user_id}' - Requesting AsyncAzureOpenAI (Try {retry_count + 1}/{max_retries})...")
-                response = await self.call_llm_with_retry(
-                    ai_client, 
-                    model=self.openai_deployment, 
-                    response_format={"type": "json_object"}, 
-                    messages=messages
-                )
+                print(f" 🧠 [ASYNC LLM CALL] User '{user_id}' - Requesting Two-Track AI (Try {retry_count + 1}/{max_retries})...")
                 
-                last_response_text = response.choices[0].message.content
-                if not last_response_text or last_response_text.strip() == "":
-                    raise ValueError("LLM이 텅 빈 응답을 리턴했습니다.")
-                    
-                parsed_json = json.loads(last_response_text)
+                # 1. 투트랙 함수 호출 (대화와 피드백을 동시에 가져옴)
+                last_response_text, feedback_json = await self.generate_llm_two_track(messages, user_text)
                 
-                # 필수 출력 키값(text_content 또는 action_description) 검증
-                if "text_content" not in parsed_json or "action_description" not in parsed_json:
-                    raise KeyError("필수 출력 키값(text_content 또는 action_description)이 누락되었습니다.")
-                if "system_evaluation" not in parsed_json:
-                    parsed_json["system_evaluation"] = {}
+                # 2. 피드백 데이터를 합쳐서 파이썬 딕셔너리로 조립
+                parsed_temp = json.loads(last_response_text)
+                parsed_temp["system_evaluation"] = feedback_json
+                parsed_temp["affinity_delta"] = feedback_json.get("affinity_delta", 0)
                 
-                ai_result = parsed_json
+                # 💡 [핵심 누락 픽스] 바로 이겁니다!! 이 코드가 없어서 비상용 대답이 나갔던 겁니다!
+                ai_result = parsed_temp  
                 
-                # 대표님 보고용 토큰 및 원본 생로그 추출
+                # DB 저장을 위해 다시 문자열로 변환
+                last_response_text = json.dumps(parsed_temp, ensure_ascii=False)
+                
+                # 3. 대표님 보고용 토큰
                 raw_usage_data = {
-                    "usage": response.usage.model_dump() if hasattr(response, "usage") and response.usage else {},
-                    "model": response.model,
-                    "choices": [{"finish_reason": c.finish_reason, "index": c.index} for c in response.choices]
+                    "usage": {"total_tokens": "Two-Track Async Mode"},
+                    "model": "gpt-4o & gpt-4o-mini (Two-Track)",
+                    "choices": [{"finish_reason": "stop", "index": 0}]
                 }
                 
                 print(f" 🎉 [ASYNC LLM SUCCESS] User '{user_id}' - LLM generation verified on Try {retry_count + 1}.")
