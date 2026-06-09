@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import asyncio
+import datetime
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -18,9 +19,8 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
-import datetime
 
-# 패키징된 AI 파이프라인 클래스 로드
+# 패키징된 최신 AI 파이프라인 클래스 로드
 from pipeline import SimSpeakAIPipeline
 
 # 환경변수 로드 (절대 경로 적용으로 터미널 꼬임 방지)
@@ -127,7 +127,6 @@ print(f"[DB Connect Attempt] Database URL: {DATABASE_URL}")
 Base = declarative_base()
 
 try:
-    # SQLite와 PostgreSQL 환경에 맞춰 최적의 옵션으로 분기 생성
     if DATABASE_URL.startswith("sqlite"):
         engine = create_engine(
             DATABASE_URL, 
@@ -150,21 +149,20 @@ class ChatLogModel(Base):
     user_id = Column(String(50), index=True, nullable=False)
     character_id = Column(String(50), index=True, nullable=False)
     user_text = Column(Text, nullable=False)
-    user_audio_url = Column(Text, nullable=True)         # 유저가 업로드한 오디오 URL 기록
+    user_audio_url = Column(Text, nullable=True)         
     ai_text_content = Column(Text, nullable=False)
-    ai_audio_url = Column(Text, nullable=True)           # AI 답변 음성 주소 기록용
-    current_affinity = Column(Integer, default=30)       # 영구 저장되는 호감도 스탯
-    summary_context = Column(Text, nullable=True)        # [토큰 절약] 오래된 과거 기억 압축 저장소
-    stage_id = Column(String(50), nullable=True)            # 진행 중인 스테이지 정보 기록
+    ai_audio_url = Column(Text, nullable=True)           
+    current_affinity = Column(Integer, default=30)       
+    summary_context = Column(Text, nullable=True)        
+    stage_id = Column(String(50), nullable=True)            
     
-    # 데이터베이스 종류에 맞춰 유연하게 컬럼 타입 세팅 (PostgreSQL일 때는 전용 고성능 JSONB 강제)
     if DATABASE_URL.startswith("sqlite"):
         from sqlalchemy import JSON
-        chat_history_context = Column(JSON, nullable=False)   # 대화 히스토리 배열 통째로 저장 (JSON)
-        raw_llm_log = Column(JSON, nullable=False)            # 대표님 보고용 토큰 및 원본 생로그 (JSON)
+        chat_history_context = Column(JSON, nullable=False)   
+        raw_llm_log = Column(JSON, nullable=False)            
     else:
-        chat_history_context = Column(JSONB, nullable=False)   # 대화 히스토리 배열 통째로 저장 (JSONB)
-        raw_llm_log = Column(JSONB, nullable=False)            # 대표님 보고용 토큰 및 원본 생로그 (JSONB)
+        chat_history_context = Column(JSONB, nullable=False)   
+        raw_llm_log = Column(JSONB, nullable=False)            
 
 # [팀원 DB 구조 통합] character_chat_logs 테이블 구조 정의
 class CharacterChatLogModel(Base):
@@ -173,7 +171,7 @@ class CharacterChatLogModel(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String(100), nullable=False)
     character_id = Column(String(50), nullable=False)
-    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.timezone.utc))
 
     if DATABASE_URL.startswith("sqlite"):
         from sqlalchemy import JSON
@@ -193,12 +191,10 @@ try:
             conn.execute(text("ALTER TABLE chat_logs ADD COLUMN stage_id VARCHAR(50);"))
         print("[DB Success] Automatically added 'stage_id' column to chat_logs table.")
     except Exception as alter_err:
-        # 이미 컬럼이 존재하는 등의 이유로 에러가 나면 무시하고 정상 진행합니다.
         print(f"[DB Info] Auto ALTER COLUMN 'stage_id' status: {alter_err}")
 except Exception as table_err:
     print(f"[DB Error] Table creation/verification failed: {table_err}")
 
-# API 요청이 올 때마다 안전하게 데이터베이스 세션을 열고 닫아주는 함수
 def get_db():
     db = SessionLocal()
     try:
@@ -208,13 +204,13 @@ def get_db():
 # =========================================================
 
 
-# 2. API 요청 데이터 스키마 (팀원 코드 유지)
+# 2. API 요청 데이터 스키마
 class ChatRequest(BaseModel):
     user_id: str
     character_id: str  
     text: str
     is_video_call: bool
-    user_audio_url: Optional[str] = None  # 다른 팀원이 Blob에 저장 후 넘겨줄 오디오 URL 주소
+    user_audio_url: Optional[str] = None  
     stage_id: Optional[str] = "stage_1"
 
 # AI 파이프라인 인스턴스 전역 생성
@@ -228,13 +224,16 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
     user_id = request.user_id
     print(f"[User: {user_id}] -> [{char_id}] Initial Input Text: {request.text}")
 
-    # [DB 연동] 로컬 DB에서 해당 유저의 최신 대화 로그 1건 가져와 복구
-    last_log = await asyncio.to_thread(
-        lambda: db.query(ChatLogModel)
-        .filter(ChatLogModel.user_id == user_id, ChatLogModel.character_id == char_id)
-        .order_by(ChatLogModel.id.desc())
-        .first()
-    )
+    # [DB 연동 스레드 안전화 기동] 람다를 걷어내고 명시적 스레드 워커 실행
+    def fetch_last_log():
+        return (
+            db.query(ChatLogModel)
+            .filter(ChatLogModel.user_id == user_id, ChatLogModel.character_id == char_id)
+            .order_by(ChatLogModel.id.desc())
+            .first()
+        )
+
+    last_log = await asyncio.to_thread(fetch_last_log)
 
     if last_log:
         history = list(last_log.chat_history_context)
@@ -243,11 +242,11 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
         print(f"[Memory Load] Restored past memory from DB. (Affinity: {current_affinity}/100, Summary exists: {bool(current_summary)})")
     else:
         history = []
-        current_affinity = 30  # 최초 대화 시 기본 친밀도
+        current_affinity = 30  
         current_summary = ""
         print("[New Chat] First conversation entry created.")
 
-    # pipeline.run() 인터페이스에 맞게 임시 세션 딕셔너리 구조 생성 (어댑터 패턴)
+    # pipeline.run() 고도화 사양 딕셔너리 수납 인스턴스 어댑터 생성
     temp_session_db = {
         user_id: {
             char_id: {
@@ -259,7 +258,7 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
     }
 
     try:
-        # 단일 파이프라인 가동 (STT -> LLM -> TTS -> Blob 업로드 일괄 수행)
+        # 최종 보정된 pipeline.run 인터페이스 규격에 맞춰 동기화 호출
         ai_result = await pipeline.run(
             session_db=temp_session_db,
             user_id=user_id,
@@ -270,34 +269,32 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
             stage_id=request.stage_id
         )
 
-        # 파이프라인 실행 후 업데이트된 세션 정보 및 친밀도 회수
         updated_data = temp_session_db[user_id][char_id]
         updated_history = updated_data["history"]
         updated_affinity = updated_data["current_affinity"]
         updated_summary = updated_data.get("summary_context", "")
 
-        # 파이프라인에서 조립된 대표님 보고용 GPT 생로그 추출
+        # 파이프라인에서 분리 통합된 원본 생로그 조립 추출
         raw_usage_log = ai_result.pop("raw_llm_log", {})
 
-        # 대화 기록 및 AI 모니터링 생로그 DB 영구 저장
         def perform_db_write():
             try:
                 new_log = ChatLogModel(
                     user_id=user_id,
                     character_id=char_id,
-                    user_text=ai_result.get("user_recognized_text", request.text),   # Whisper가 감지한 텍스트 반영
+                    user_text=ai_result.get("user_recognized_text", request.text),   
                     user_audio_url=request.user_audio_url,
                     ai_text_content=ai_result.get("text_content", ""),
-                    ai_audio_url=ai_result.get("audio_url", ""),                    # 실제 합성되어 업로드된 TTS 오디오 주소
+                    ai_audio_url=ai_result.get("audio_url", ""),                    
                     current_affinity=updated_affinity,       
-                    chat_history_context=updated_history,                            # JSON/JSONB 타입으로 대화 배열 통째로 적재
-                    raw_llm_log=raw_usage_log,                                       # JSON/JSONB 타입으로 토큰 사용량 생로그 저장
-                    summary_context=updated_summary,                                 # 압축 누적된 장기 기억 요약본 저장
+                    chat_history_context=updated_history,                            
+                    raw_llm_log=raw_usage_log,                                       
+                    summary_context=updated_summary,                                 
                     stage_id=request.stage_id
                 )
                 db.add(new_log)
 
-                # [팀원 DB 구조 통합] character_chat_logs 테이블에도 동일하게 response JSON 저장
+                # [팀원 DB 구조 통합] character_chat_logs 테이블 적재 데이터 일치 보정
                 new_monitoring_log = CharacterChatLogModel(
                     user_id=user_id,
                     character_id=char_id,
@@ -305,7 +302,7 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
                 )
                 db.add(new_monitoring_log)
 
-                db.commit() # 데이터베이스 저장 확정!
+                db.commit() 
             except Exception as write_err:
                 db.rollback()
                 raise write_err
