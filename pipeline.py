@@ -24,7 +24,7 @@ class SimSpeakAIPipeline:
         self.speech_region = os.getenv("AZURE_SPEECH_REGION", "eastus")
         self.storage_connection = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 
-        # 🚀 [최적화 핵심] 커넥션 풀링 (Connection Pooling)
+        # [최적화 핵심] 커넥션 풀링 (Connection Pooling)
         self.http_client = httpx.AsyncClient(timeout=15.0)
         
         self.llm_client = AsyncAzureOpenAI(
@@ -68,12 +68,12 @@ class SimSpeakAIPipeline:
                 model="gpt-4o-mini",
                 messages=safe_messages,
                 max_tokens=250,
-                # 💡 [핵심 수정] OpenAI가 무조건 완벽한 JSON 형식만 반환하도록 강제 (파싱 에러 원천 차단)
+                # [핵심 수정] OpenAI가 무조건 완벽한 JSON 형식만 반환하도록 강제 (파싱 에러 원천 차단)
                 response_format={"type": "json_object"} 
             )
             return response.choices[0].message.content
         except Exception as e:
-            print(f"🚨 [초고속 대사 엔진] 장애 우회 처리: {e}")
+            print(f"[초고속 대사 엔진] 장애 우회 처리: {e}")
             return '{"detected_invalid_words": [], "text_content": "앗, 미안해! 데이터가 살짝 밀렸나 봐. 다시 말해줄래?", "action_description": "멋쩍게 웃는다.", "affinity_delta": 0, "system_notification": "", "is_active": true}'
     
     def make_ssml(self, character_id: str, text_content: str) -> str:
@@ -104,10 +104,10 @@ class SimSpeakAIPipeline:
             whisper_result = await self.whisper_api_client.audio.transcriptions.create(
                 file=audio_file, model=self.whisper_deployment, prompt="Hello! 안녕하세요.", language="en"
             )
-            print(f" 🔍 [ASYNC FLOW] User '{user_id}' - Whisper Text Extracted: '{whisper_result.text}'")
+            print(f" [ASYNC FLOW] User '{user_id}' - Whisper Text Extracted: '{whisper_result.text}'")
             return whisper_result.text
         except Exception as e:
-            print(f" ❌ [WHISPER ERROR] User '{user_id}' - {e}")
+            print(f" [WHISPER ERROR] User '{user_id}' - {e}")
             return ""
 
     async def run_azure_pronunciation_assessment(self, user_id: str, audio_url: str, reference_text: str) -> dict:
@@ -119,7 +119,7 @@ class SimSpeakAIPipeline:
         try:
             response = await self.http_client.get(audio_url)
             if response.status_code != 200: 
-                print(f" ❌ [SPEECH ACC] 오디오 다운로드 에러. HTTP {response.status_code}")
+                print(f" [SPEECH ACC] 오디오 다운로드 에러. HTTP {response.status_code}")
                 return error_response
                 
             with open(temp_audio_file, "wb") as f:
@@ -159,7 +159,7 @@ class SimSpeakAIPipeline:
             else:
                 return error_response
         except Exception as e:
-            print(f" ❌ [SPEECH CRITICAL ERROR] {e}")
+            print(f" [SPEECH CRITICAL ERROR] {e}")
             return error_response
         finally:
             if os.path.exists(temp_audio_file):
@@ -196,7 +196,7 @@ class SimSpeakAIPipeline:
         async with aiofiles.open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: return await f.read()
 
     # =========================================================================
-    # ⚡ 1차 초고속 대사 처리 (텍스트/음성 모드 완벽 분기 적용 + 콩글리시/한국어 페널티 트랙)
+    # 1차 초고속 대사 처리 (텍스트/음성 모드 완벽 분기 적용 + 티키타카 질문 유도)
     # =========================================================================
     async def run_only_dialogue_track(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: str = "stage_1") -> dict:
         char_id = character_id.lower()
@@ -218,19 +218,21 @@ class SimSpeakAIPipeline:
             "TEXT MESSAGE MODE: You are chatting via text. NO physical contact. Describe independent 3rd-person actions (e.g., looking at phone, drinking coffee, sighing alone)."
         )
 
+        # [티키타카 질문 룰 추가 완료] 대화가 끊기지 않도록 대사 끝에 질문을 달도록 강제
         json_injection_rule = """
         [CRITICAL OUTPUT RULE & FAST TRACK JSON FORMAT]
         IGNORE the [STRICT OUTPUT FORMAT] in your base persona. DO NOT generate 'system_evaluation' or 'corrections'.
         You MUST respond ONLY with a raw, pure JSON object matching this schema.
 
-        [🚨 URGENT INSTRUCTION]
+        [URGENT INSTRUCTION]
         1. FIRST, analyze the user's text. Extract ONLY Konglish words (e.g., "man-to-man", "notebook" for laptop, "cider" for soda) into "detected_invalid_words". 
         Do NOT extract pure Korean words (e.g., "진짜", "대박") here. Only extract Konglish. If none, output [].
         2. THEN, generate your character's response.
+        3. [CONVERSATION CONTINUATION]: ALWAYS end your "text_content" with a natural, context-relevant follow-up question. The character MUST ask the user something to keep the conversation flowing.
 
         {
           "detected_invalid_words": [],
-          "text_content": "Your verbal response in English",
+          "text_content": "Your verbal response in English. (MUST end with a question mark '?')",
           "action_description": "Behavioral status in Korean",
           "affinity_delta": integer (-5 to 5, based strictly on your persona rules),
           "system_notification": "Warning message if applicable, else empty string",
@@ -249,16 +251,18 @@ class SimSpeakAIPipeline:
                 messages.append({"role": turn["role"], "content": turn["content"]})
         messages.append({"role": "user", "content": user_text})
 
-        print(f" 🧠 [ASYNC LLM CALL] User '{user_id}' - Requesting Dialogue 가속엔진 가동...")
+        print(f" [ASYNC LLM CALL] User '{user_id}' - Requesting Dialogue 가속엔진 가동...")
         raw_response = await self.generate_lightning_dialogue(messages)
         
-        # 🟢 [수정됨] 정규식(Regex) 대신 100% 안전한 기본 replace 함수를 사용하여 복사 에러 원천 차단!
-        clean_json_str = raw_response.replace("```json", "").replace("```", "").strip()
+        # [안전성 보강] 마크다운 복사 깨짐 원천 방지용 백틱 결합법 사용
+        safe_json_tag = "``" + "`json"
+        safe_backticks = "``" + "`"
+        clean_json_str = raw_response.replace(safe_json_tag, "").replace(safe_backticks, "").strip()
         
         try:
             ai_result = json.loads(clean_json_str)
         except Exception as e:
-            print(f"🚨 [트랙 1 JSON 파싱 에러]: {e} / 원본 응답: {raw_response}")
+            print(f"[트랙 1 JSON 파싱 에러]: {e} / 원본 응답: {raw_response}")
             text_match = re.search(r'"text_content"\s*:\s*"([^"]+)"', clean_json_str)
             action_match = re.search(r'"action_description"\s*:\s*"([^"]+)"', clean_json_str)
             ai_result = {
@@ -268,7 +272,7 @@ class SimSpeakAIPipeline:
                 "affinity_delta": 0, "is_active": True, "system_notification": ""
             }
 
-        # 🚀 통합 감점 로직 계산
+        # 통합 감점 로직 계산
         affinity_delta = ai_result.get("affinity_delta", 0)
         ai_result["system_evaluation"] = {"is_penalty": False}
 
@@ -318,7 +322,7 @@ class SimSpeakAIPipeline:
         return ai_result
 
     # =========================================================================
-    # ⚡ 2차 오답노트 백그라운드 (차단벽 제거 및 텍스트 검사 무조건 실행 완벽 적용)
+    # 2차 오답노트 백그라운드 
     # =========================================================================
     async def run_only_evaluation_track(self, user_id: str, character_id: str, user_text: str, stage_id: str = "stage_1", user_audio_url: str = None) -> dict:
         char_id = character_id.lower()
@@ -360,17 +364,16 @@ class SimSpeakAIPipeline:
                 self.llm_client, 
                 model="gpt-4o-mini", 
                 messages=[{"role": "system", "content": system_feedback_prompt}, {"role": "user", "content": [{"type": "text", "text": str(user_text)}]}],
-                # 💡 2차 트랙에도 JSON Mode 추가하여 파싱 에러 방지
+                # 2차 트랙에도 JSON Mode 추가하여 파싱 에러 방지
                 response_format={"type": "json_object"} 
             )
-            # 🟢 [수정됨] 정규식(Regex) 대신 100% 안전한 기본 replace 함수를 사용하여 복사 에러 원천 차단!
+            # [수정됨] 정규식(Regex) 대신 100% 안전한 기본 replace 함수를 사용하여 복사 에러 원천 차단!
             raw_feedback_content = response.choices[0].message.content
             clean_feedback = raw_feedback_content.replace("```json", "").replace("```", "").strip()
             feedback_json = json.loads(clean_feedback)
         except Exception:
             feedback_json = {"is_penalty": False, "grammar_feedback": "시스템 분석 지연으로 실시간 문법 교정이 불가능합니다.", "corrections_json": [], "ipa_guides": {}}
         
-        # LLM이 배열을 채웠는데 is_penalty를 깜빡했을 경우를 대비한 안전장치
         if "detected_invalid_words" in feedback_json and len(feedback_json["detected_invalid_words"]) > 0:
             feedback_json["is_penalty"] = True
 
@@ -417,3 +420,26 @@ class SimSpeakAIPipeline:
                 feedback_json["pronunciation_feedback"] = "오디오 데이터 인식이 실패하여 정밀 발음 평가를 수립할 수 없습니다."
 
         return {"system_evaluation": feedback_json}
+
+    # =========================================================================
+    # 통합 실행 매니저 (main.py의 pipeline.run() 호출 완벽 대응)
+    # =========================================================================
+    async def run(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: str = "stage_1") -> dict:
+        # 1. 1차 초고속 대사 트랙 실행 (Whisper 음성 추출 포함)
+        ai_result = await self.run_only_dialogue_track(
+            session_db=session_db, user_id=user_id, character_id=character_id,
+            user_text=user_text, is_video_call=is_video_call, 
+            user_audio_url=user_audio_url, stage_id=stage_id
+        )
+        
+        # 2. 2차 오답노트 트랙 실행 (1차에서 해독된 텍스트를 넘겨줌)
+        recognized_text = ai_result.get("user_recognized_text", user_text)
+        eval_result = await self.run_only_evaluation_track(
+            user_id=user_id, character_id=character_id, 
+            user_text=recognized_text, stage_id=stage_id, user_audio_url=user_audio_url
+        )
+        
+        # 3. 1차와 2차 결과 완벽 병합
+        ai_result.update(eval_result)
+        
+        return ai_result
