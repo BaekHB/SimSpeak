@@ -91,7 +91,7 @@ class SimSpeakAIPipeline:
         wrapped_text = pattern.sub(r'<lang xml:lang="ko-KR">\1</lang>', text_content)
         return f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US"><voice name="{voice_name}"><prosody rate="{rate}" pitch="{pitch}">{wrapped_text}</prosody></voice></speak>'
 
-    async def quick_whisper_transcription(self, user_id: str, audio_url: str) -> str:
+    async def quick_whisper_transcription(self, user_id: int, audio_url: str) -> str:
         if not audio_url: return ""
         try:
             response = await self.http_client.get(audio_url)
@@ -110,7 +110,7 @@ class SimSpeakAIPipeline:
             print(f" [WHISPER ERROR] User '{user_id}' - {e}")
             return ""
 
-    async def run_azure_pronunciation_assessment(self, user_id: str, audio_url: str, reference_text: str) -> dict:
+    async def run_azure_pronunciation_assessment(self, user_id: int, audio_url: str, reference_text: str) -> dict:
         error_response = {"accuracy": 0, "fluency": 0, "completeness": 0, "prosody": 0, "word_details_json": []}
         if not audio_url or not reference_text or reference_text.strip() == "": 
             return error_response
@@ -166,7 +166,7 @@ class SimSpeakAIPipeline:
                 try: os.remove(temp_audio_file)
                 except: pass
 
-    async def generate_tts(self, user_id: str, character_id: str, text_content: str) -> str:
+    async def generate_tts(self, user_id: int, character_id: str, text_content: str) -> str:
         if not text_content or text_content.strip() == "":
             return ""
         
@@ -210,7 +210,7 @@ class SimSpeakAIPipeline:
     # =========================================================================
     # 1차 초고속 대사 처리 (텍스트/음성 모드 완벽 분기 적용 + 티키타카 질문 유도)
     # =========================================================================
-    async def run_only_dialogue_track(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: str = "stage_1") -> dict:
+    async def run_only_dialogue_track(self, session_db: dict, user_id: int, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: int = 1) -> dict:
         char_id = character_id.lower()
         if user_id not in session_db: session_db[user_id] = {}
         if char_id not in session_db[user_id]: session_db[user_id][char_id] = {"history": [], "current_affinity": 30, "summary_context": ""}
@@ -301,9 +301,13 @@ class SimSpeakAIPipeline:
             mixed_ratio = total_invalid_count / len(words)
             
         stage_clean = str(stage_id).lower().strip().replace(" ", "_")
-        threshold = 0.30
-        if stage_clean in ["stage_3", "stage_4", "stage_5", "stage_6"]: threshold = 0.20
-        elif stage_clean in ["stage_7", "stage_8"]: threshold = 0.10
+    
+        if stage_id in [3, 4, 5, 6]: 
+            threshold = 0.20
+        elif stage_id in [7, 8]: 
+            threshold = 0.10
+        else:
+            threshold = 0.30
 
         # 3. 합산된 혼용률이 스테이지 임계치(10~30%)를 넘었을 때만 감점
         if mixed_ratio >= threshold:
@@ -336,7 +340,7 @@ class SimSpeakAIPipeline:
     # =========================================================================
     # 2차 오답노트 백그라운드 
     # =========================================================================
-    async def run_only_evaluation_track(self, user_id: str, character_id: str, user_text: str, stage_id: str = "stage_1", user_audio_url: str = None) -> dict:
+    async def run_only_evaluation_track(self, user_id: int, character_id: str, user_text: str, stage_id: int = 1, user_audio_url: str = None) -> dict:
         char_id = character_id.lower()
         
         if not user_text or user_text.strip() == "":
@@ -436,7 +440,7 @@ class SimSpeakAIPipeline:
     # =========================================================================
     # 통합 실행 매니저 (main.py의 pipeline.run() 호출 완벽 대응)
     # =========================================================================
-    async def run(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: str = "stage_1") -> dict:
+    async def run(self, session_db: dict, user_id: int, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: int = 1) -> dict:
         # 1. 1차 초고속 대사 트랙 실행 (Whisper 음성 추출 포함)
         ai_result = await self.run_only_dialogue_track(
             session_db=session_db, user_id=user_id, character_id=character_id,
