@@ -21,22 +21,28 @@ load_dotenv(dotenv_path=env_path)
 
 app = FastAPI(title="SimSpeak Lightning Async Core API")
 
+print("--- [디버그] DB 설정 시작 ---")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./simspeak.db")
+print(f"DATABASE_URL: {DATABASE_URL}")
 Base = declarative_base()
 
 try:
+    print("--- [디버그] 엔진 생성 중 ---")
     if DATABASE_URL.startswith("sqlite"):
         engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
     else:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        print("--- [디버그] 엔진 생성 완료 ---")
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 except Exception as db_err:
     print(f"[DB Error] {db_err}")
 
+print("--- [디버그] DB 설정 끝, 앱 시작 ---")
+
 class ChatLogModel(Base):
     __tablename__ = "chat_logs"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String(50), index=True, nullable=False)
+    user_id = Column(Integer, index=True, nullable=False)
     character_id = Column(String(50), index=True, nullable=False)
     user_text = Column(Text, nullable=False)
     user_audio_url = Column(Text, nullable=True)         
@@ -44,7 +50,7 @@ class ChatLogModel(Base):
     ai_audio_url = Column(Text, nullable=True)           
     current_affinity = Column(Integer, default=30)       
     summary_context = Column(Text, nullable=True)        
-    stage_id = Column(String(50), nullable=True)            
+    stage_id = Column(Integer, nullable=True)        
     
     if DATABASE_URL.startswith("sqlite"):
         from sqlalchemy import JSON
@@ -57,7 +63,7 @@ class ChatLogModel(Base):
 class CharacterChatLogModel(Base):
     __tablename__ = "character_chat_logs"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String(100), nullable=False)
+    user_id = Column(Integer, index=True, nullable=False)
     character_id = Column(String(50), nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.timezone.utc))
     if DATABASE_URL.startswith("sqlite"):
@@ -69,7 +75,7 @@ class CharacterChatLogModel(Base):
 class EnglishLevelTestModel(Base):
     __tablename__ = "english_level_tests"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String(50), index=True, nullable=False)
+    user_id = Column(Integer, index=True, nullable=False)
     test_type = Column(String(50), nullable=False, default="PLACEMENT")
     assigned_level = Column(String(10), nullable=False)
     test_score = Column(Integer, nullable=True)
@@ -81,9 +87,11 @@ class EnglishLevelTestModel(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.timezone.utc))
 
 try:
+    print("DB 테이블 생성 시작...")
     Base.metadata.create_all(bind=engine)
-except Exception:
-    pass
+    print("DB 테이블 생성 완료!")
+except Exception as e:
+    print(f"DB 테이블 생성 실패: {e}")
 
 def get_db():
     db = SessionLocal()
@@ -93,15 +101,15 @@ def get_db():
         db.close()
 
 class UnifiedChatRequest(BaseModel):
-    user_id: str
+    user_id: int
     character_id: str
     text: str  
     is_video_call: bool
     user_audio_url: Optional[str] = None  
-    stage_id: Optional[str] = "stage_1"
+    stage_id: Optional[int] = 1
 
 class UnifiedLevelTestRequest(BaseModel):
-    user_id: str
+    user_id: int
     character_id: str
     current_question_index: int  # 1 ~ 8
     user_audio_url: Optional[str] = None
@@ -111,7 +119,7 @@ class UnifiedLevelTestRequest(BaseModel):
 
 pipeline = SimSpeakAIPipeline()
 
-async def background_evaluation_worker(user_id: str, char_id: str, stage_id: str, user_audio_url: str, dialogue_result: dict):
+async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int, user_audio_url: str, dialogue_result: dict):
     db = SessionLocal()
     try:
         print(f"▶️ [비동기 병렬 피드백 트랙] 스타트 (오답노트 및 정밀 발음 평가 중...)")
