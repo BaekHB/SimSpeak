@@ -169,25 +169,37 @@ class SimSpeakAIPipeline:
     async def generate_tts(self, user_id: str, character_id: str, text_content: str) -> str:
         if not text_content or text_content.strip() == "":
             return ""
+        
         temp_filename = f"reply_{uuid.uuid4().hex[:8]}.mp3"
+        
         try:
-            def run_tts_synthesis():
-                speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
-                audio_config = speechsdk.audio.AudioOutputConfig(filename=temp_filename)
-                synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
-                synthesizer.speak_ssml_async(self.make_ssml(character_id, text_content)).get()
-            await asyncio.to_thread(run_tts_synthesis)
+            # ========================================================
+            # 1. 애저 대신 작성자님이 만든 일레븐랩스 매니저 호출!
+            # ========================================================
+            from elevenlabs_manager import generate_elevenlabs_audio
+            success = await generate_elevenlabs_audio(character_id, text_content, temp_filename)
+            
+            # 생성에 실패했으면 빈 문자열 반환
+            if not success:
+                return ""
 
+            # ========================================================
+            # 2. 팀원이 짜둔 애저 클라우드(Blob) 업로드 코드는 100% 그대로 유지
+            # ========================================================
             def upload_to_blob():
                 blob_client = self.blob_container.get_blob_client(temp_filename)
                 with open(temp_filename, "rb") as data: 
                     blob_client.upload_blob(data, overwrite=True)
                 return blob_client.url
+            
             blob_url = await asyncio.to_thread(upload_to_blob)
             return blob_url
-        except Exception:
+            
+        except Exception as e:
+            print(f"🎙️ 음성 생성 및 업로드 에러: {e}")
             return ""
         finally:
+            # 3. 로컬 찌꺼기 파일 삭제
             if os.path.exists(temp_filename):
                 try: os.remove(temp_filename)
                 except: pass
@@ -443,3 +455,155 @@ class SimSpeakAIPipeline:
         ai_result.update(eval_result)
         
         return ai_result
+
+    # =========================================================================
+    # ⚡ 3차 레벨 테스트 전용 트랙 (피드백 없이 등급/점수만 깔끔하게 반환)
+    # =========================================================================
+    async def process_level_test_question(self, user_id: str, character_id: str, question_index: int, user_audio_url: str = None, user_text: str = "", is_finishing: bool = False) -> dict:
+        char_id = character_id.lower()
+        
+        if user_audio_url:
+            extracted_text = await self.quick_whisper_transcription(user_id, user_audio_url)
+            if extracted_text:
+                user_text = extracted_text
+        
+        pronunciation_evaluations = None
+        if user_audio_url and user_text:
+            pronunciation_evaluations = await self.run_azure_pronunciation_assessment(user_id, user_audio_url, user_text)
+
+        questions = [
+            "Let's get to know you first! What's your name, and what are you like?",
+            "Describe your ideal type. What kind of person do you find attractive?",
+            "Tell me about a time you felt your heart flutter. What happened?",
+            "On a first date, do you prefer a quiet café or a fun activity? Why?",
+            "How would you make a good first impression on someone you like? Walk me through it.",
+            "Imagine your perfect date. Where would you go, and how would it be different from an ordinary day?",
+            "What do you think makes two people a good match? Give examples.",
+            "Some say first impressions decide everything in romance. Do you agree? Share your thoughts."
+        ]
+        
+        next_question_audio_url = None
+        next_question_text = None
+        
+        # 1~7번 문항이고 현재 종료하는 중이 아니라면, 다음 번호의 질문을 읽어주는 TTS 생성
+        if (1 <= question_index < 8) and not is_finishing:
+            next_question_text = questions[question_index] 
+            next_question_audio_url = await self.generate_tts(user_id, char_id, next_question_text)
+            
+        return {
+            "user_recognized_text": user_text,
+            "pronunciation_evaluations": pronunciation_evaluations,
+            "next_question_text": next_question_text,
+            "next_question_audio_url": next_question_audio_url
+        }
+
+    async def evaluate_holistic_cefr_level(self, user_answers: list) -> dict:
+        # 발음 점수 평균 계산
+        total_acc, total_flu, valid_audio_count = 0, 0, 0
+        for ans in user_answers:
+            if ans.get("accuracy") is not None and ans.get("fluency") is not None:
+                total_acc += ans["accuracy"]
+                total_flu += ans["fluency"]
+                valid_audio_count += 1
+                
+        avg_pronunciation = 0
+        if valid_audio_count > 0:
+            avg_pronunciation = (total_acc + total_flu) / (2 * valid_audio_count)
+
+        transcript_str = ""
+        for ans in user_answers:
+            transcript_str += f"Q{ans.get('question_index')}: {ans.get('text', '(No answer)')}\n"
+
+        system_prompt = f"""
+        You are an expert CEFR English evaluator.
+        You will be provided with a user's answers to the level test questions.
+        Note: The user may have quit early, so there may be fewer than 8 questions. Evaluate based ONLY on the provided transcripts.
+        
+        [Evaluation Criteria]
+        - A1/A2: Single words or simple sentences. Struggles with basic past tense.
+        - B1: Connects sentences with basic conjunctions. Good use of past tense for experiences.
+        - B2: Clear reasoning, uses 'because/so/if' properly. Uses conditionals.
+        - C1/C2: Abstract arguments, complex grammar (although, whereas), diverse vocabulary.
+        
+        [Detailed Metrics & Strict Grading Rubric (Score out of 100)]
+        Apply the following strict rubric for fairness and consistency.
+        
+        1. expression_score:
+           - 90-100: Near-native, highly natural phrasing, uses idioms/phrasal verbs well.
+           - 70-89: Clear meaning, but some awkward phrasing or Konglish (direct translations).
+           - 50-69: Noticeably unnatural, causing slight confusion for a native speaker.
+           - 0-49: Literal translations from native language making it hard to understand.
+           
+        2. grammar_score:
+           - 90-100: Flawless grammar or at most 1 minor slip. Uses complex structures well.
+           - 70-89: Accurate simple sentences, but occasional errors in tense/agreement in longer sentences.
+           - 50-69: Frequent basic grammar errors that often disrupt sentence structure.
+           - 0-49: Severe grammar breakdown making basic subject-verb relationships unclear.
+           
+        3. task_completion_score: (Grade based ONLY on the questions the user actually answered)
+           - 90-100: Understands perfectly, provides detailed answers with reasons/examples.
+           - 70-89: Answers the question but lacks elaboration; somewhat brief.
+           - 50-69: Off-topic answers or extremely short one-word/phrase responses.
+           - 0-49: Fails to understand the question, completely off-topic, or says "I don't know".
+           
+        4. vocabulary_score:
+           - 90-100: Rich, advanced vocabulary (C1/C2) and varied adjectives/adverbs.
+           - 70-89: Standard everyday words (B1/B2), some repetition of words.
+           - 50-69: Highly limited, repetitive, basic words (A1/A2) like 'good', 'bad', 'very'.
+           - 0-49: Lacks the vocabulary to express basic thoughts in English.
+        
+        [User Transcripts]
+        {transcript_str}
+        
+        [Average Fluency Score from Speech Engine (0-100)]
+        {avg_pronunciation:.1f}
+        
+        Based on the transcripts and the provided fluency score, evaluate the overall English level and detailed metrics.
+        The 'fluency_score' MUST be exactly {int(avg_pronunciation)}.
+        The 'test_score' should be the overall average of the 5 detailed metrics.
+        DO NOT provide any detailed feedback explanations. ONLY return a JSON object.
+        
+        [OUTPUT FORMAT]
+        {{
+            "assigned_level": "A1" | "A2" | "B1" | "B2" | "C1" | "C2",
+            "test_score": integer (0 to 100),
+            "fluency_score": {int(avg_pronunciation)},
+            "expression_score": integer (0 to 100),
+            "grammar_score": integer (0 to 100),
+            "task_completion_score": integer (0 to 100),
+            "vocabulary_score": integer (0 to 100)
+        }}
+        
+        CRITICAL RULES FOR SCORING:
+        1. DO NOT give the exact same score for all 4 metrics. Evaluate each independently.
+        2. DO NOT just pick boundary numbers like 70, 89, 90. Pick a precise number within the range (e.g., 73, 84, 91) based on the exact quality of the transcript.
+        """
+
+        try:
+            response = await self.call_llm_with_retry(
+                self.llm_client, 
+                model="gpt-4o-mini", 
+                messages=[{"role": "system", "content": system_prompt}],
+                response_format={"type": "json_object"} 
+            )
+            raw_content = response.choices[0].message.content
+            clean_str = raw_content.replace("```json", "").replace("```", "").strip()
+            parsed_data = json.loads(clean_str)
+            
+            # AI의 산술 연산 오류를 방지하기 위해 파이썬에서 직접 5개 지표 평균 계산
+            total_sum = (
+                parsed_data.get("fluency_score", 0) +
+                parsed_data.get("expression_score", 0) +
+                parsed_data.get("grammar_score", 0) +
+                parsed_data.get("task_completion_score", 0) +
+                parsed_data.get("vocabulary_score", 0)
+            )
+            parsed_data["test_score"] = int(round(total_sum / 5.0))
+            
+            return parsed_data
+        except Exception as e:
+            print(f"❌ [Level Test Eval Error]: {e}")
+            return {
+                "assigned_level": "A1", "test_score": 0, "fluency_score": 0, 
+                "expression_score": 0, "grammar_score": 0, "task_completion_score": 0, "vocabulary_score": 0
+            }

@@ -66,6 +66,20 @@ class CharacterChatLogModel(Base):
     else:
         response_data = Column(JSONB, nullable=False)
 
+class EnglishLevelTestModel(Base):
+    __tablename__ = "english_level_tests"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(50), index=True, nullable=False)
+    test_type = Column(String(50), nullable=False, default="PLACEMENT")
+    assigned_level = Column(String(10), nullable=False)
+    test_score = Column(Integer, nullable=True)
+    fluency_score = Column(Integer, nullable=True)
+    expression_score = Column(Integer, nullable=True)
+    grammar_score = Column(Integer, nullable=True)
+    task_completion_score = Column(Integer, nullable=True)
+    vocabulary_score = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.timezone.utc))
+
 try:
     Base.metadata.create_all(bind=engine)
 except Exception:
@@ -85,6 +99,15 @@ class UnifiedChatRequest(BaseModel):
     is_video_call: bool
     user_audio_url: Optional[str] = None  
     stage_id: Optional[str] = "stage_1"
+
+class UnifiedLevelTestRequest(BaseModel):
+    user_id: str
+    character_id: str
+    current_question_index: int  # 1 ~ 8
+    user_audio_url: Optional[str] = None
+    user_text: Optional[str] = None
+    accumulated_answers: Optional[list] = []
+    is_quit: Optional[bool] = False
 
 pipeline = SimSpeakAIPipeline()
 
@@ -177,14 +200,76 @@ async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session =
         )
 
         return {
-          "text_content": dialogue_result.get("text_content"),
-          "action_description": dialogue_result.get("action_description"),
-          "audio_url": dialogue_result.get("audio_url"),
-          "user_recognized_text": dialogue_result.get("user_recognized_text"),
-          "affinity_delta": dialogue_result.get("affinity_delta"),
-          "current_total_affinity": dialogue_result.get("current_total_affinity")
+            "text_content": dialogue_result.get("text_content"),
+            "action_description": dialogue_result.get("action_description"),
+            "audio_url": dialogue_result.get("audio_url"),
+            "user_recognized_text": dialogue_result.get("user_recognized_text"),
+            "affinity_delta": dialogue_result.get("affinity_delta"),
+            "current_total_affinity": dialogue_result.get("current_total_affinity")
         }
 
     except Exception as e:
         print(f"❌ [메인 트랙 치명적 에러]: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/chat/level_test")
+async def process_level_test_question(request: UnifiedLevelTestRequest, db: Session = Depends(get_db)):
+    try:
+        # 종료 요청이 들어왔는지 확인
+        is_finishing = (request.current_question_index == 8) or request.is_quit
+        
+        result = await pipeline.process_level_test_question(
+            user_id=request.user_id,
+            character_id=request.character_id,
+            question_index=request.current_question_index,
+            user_audio_url=request.user_audio_url,
+            user_text=request.user_text or "",
+            is_finishing=is_finishing
+        )
+        
+        # 8번 문항 도달이거나 사용자가 중간 종료를 요청했을 때 동기식 종합 평가 진행
+        if is_finishing:
+            accuracy = None
+            fluency = None
+            if result.get("pronunciation_evaluations"):
+                accuracy = result["pronunciation_evaluations"].get("accuracy")
+                fluency = result["pronunciation_evaluations"].get("fluency")
+                
+            # 현재 답변 누적
+            if request.accumulated_answers is not None:
+                request.accumulated_answers.append({
+                    "question_index": request.current_question_index,
+                    "text": result.get("user_recognized_text", ""),
+                    "accuracy": accuracy,
+                    "fluency": fluency
+                })
+                
+            print(f"▶️ [레벨 테스트 종합 평가] 스타트 ({len(request.accumulated_answers)}개의 문항 분석 중...)")
+            final_result = await pipeline.evaluate_holistic_cefr_level(request.accumulated_answers)
+            
+            # DB 저장
+            new_test = EnglishLevelTestModel(
+                user_id=request.user_id,
+                test_type="PLACEMENT",
+                assigned_level=final_result.get("assigned_level", "A1"),
+                test_score=final_result.get("test_score", 0),
+                fluency_score=final_result.get("fluency_score", 0),
+                expression_score=final_result.get("expression_score", 0),
+                grammar_score=final_result.get("grammar_score", 0),
+                task_completion_score=final_result.get("task_completion_score", 0),
+                vocabulary_score=final_result.get("vocabulary_score", 0)
+            )
+            db.add(new_test)
+            db.commit()
+            print(f"✅ [레벨 테스트 종합 평가] 완료 및 DB 저장 성공: {final_result.get('assigned_level')}")
+            
+            # 클라이언트 화면 출력을 위해 즉시 결과 포함하여 리턴
+            result["is_finished"] = True
+            result["final_result"] = final_result
+            
+        else:
+            result["is_finished"] = False
+            
+        return result
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
