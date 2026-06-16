@@ -157,7 +157,6 @@ async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int
         }
         new_monitoring_log = CharacterChatLogModel(user_id=user_id, character_id=char_id, response_data=final_monitoring_data)
         
-        # 🚀 [DB 블로킹 제거] DB 저장도 백그라운드 스레드로 위임하여 서버 마비 방지
         def save_to_db():
             db.add(new_log)
             db.add(new_monitoring_log)
@@ -178,7 +177,6 @@ async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session =
     char_id = request.character_id.lower()
     user_id = request.user_id
 
-    # 🚀 [DB 블로킹 제거] 동기식 DB 쿼리가 FastAPI 메인 루프를 멈추지 못하게 스레드로 분리!
     def fetch_last_log():
         return db.query(ChatLogModel).filter(
             ChatLogModel.user_id == user_id, 
@@ -213,7 +211,8 @@ async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session =
             "audio_url": dialogue_result.get("audio_url"),
             "user_recognized_text": dialogue_result.get("user_recognized_text"),
             "affinity_delta": dialogue_result.get("affinity_delta"),
-            "current_total_affinity": dialogue_result.get("current_total_affinity")
+            "current_total_affinity": dialogue_result.get("current_total_affinity"),
+            "system_notification": dialogue_result.get("system_notification", "")
         }
 
     except Exception as e:
@@ -223,7 +222,6 @@ async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session =
 @app.post("/api/v1/chat/level_test")
 async def process_level_test_question(request: UnifiedLevelTestRequest, db: Session = Depends(get_db)):
     try:
-        # 종료 요청이 들어왔는지 확인
         is_finishing = (request.current_question_index == 8) or request.is_quit
         
         result = await pipeline.process_level_test_question(
@@ -235,7 +233,6 @@ async def process_level_test_question(request: UnifiedLevelTestRequest, db: Sess
             is_finishing=is_finishing
         )
         
-        # 8번 문항 도달이거나 사용자가 중간 종료를 요청했을 때 동기식 종합 평가 진행
         if is_finishing:
             accuracy = None
             fluency = None
@@ -243,7 +240,6 @@ async def process_level_test_question(request: UnifiedLevelTestRequest, db: Sess
                 accuracy = result["pronunciation_evaluations"].get("accuracy")
                 fluency = result["pronunciation_evaluations"].get("fluency")
                 
-            # 현재 답변 누적
             if request.accumulated_answers is not None:
                 request.accumulated_answers.append({
                     "question_index": request.current_question_index,
@@ -255,7 +251,6 @@ async def process_level_test_question(request: UnifiedLevelTestRequest, db: Sess
             print(f"▶️ [레벨 테스트 종합 평가] 스타트 ({len(request.accumulated_answers)}개의 문항 분석 중...)")
             final_result = await pipeline.evaluate_holistic_cefr_level(request.accumulated_answers)
             
-            # DB 저장
             new_test = EnglishLevelTestModel(
                 user_id=request.user_id,
                 test_type="PLACEMENT",
@@ -271,7 +266,6 @@ async def process_level_test_question(request: UnifiedLevelTestRequest, db: Sess
             db.commit()
             print(f"✅ [레벨 테스트 종합 평가] 완료 및 DB 저장 성공: {final_result.get('assigned_level')}")
             
-            # 클라이언트 화면 출력을 위해 즉시 결과 포함하여 리턴
             result["is_finished"] = True
             result["final_result"] = final_result
             
