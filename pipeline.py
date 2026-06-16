@@ -244,7 +244,7 @@ class SimSpeakAIPipeline:
           "detected_invalid_words": [],
           "text_content": "Your verbal response in English.",
           "action_description": "Behavioral status in Korean",
-          "affinity_delta": integer,
+          "affinity_delta": integer (-1, 0, 1),
           "system_notification": "String"
         }
         """
@@ -297,7 +297,12 @@ class SimSpeakAIPipeline:
             
             return ai_result
 
-        affinity_delta = ai_result.get("affinity_delta", 0)
+        try:
+            affinity_delta = int(ai_result.get("affinity_delta", 0))
+            affinity_delta = max(-1, min(1, affinity_delta)) # 파이썬 단에서도 강제로 -1 ~ +1 사이로 묶음
+        except Exception:
+            affinity_delta = 0
+            
         ai_result["system_evaluation"] = {"is_penalty": False}
 
         detected_invalid = ai_result.get("detected_invalid_words", [])
@@ -487,12 +492,23 @@ class SimSpeakAIPipeline:
             "Some say first impressions decide everything in romance. Do you agree? Share your thoughts."
         ]
         
+        pregenerated_audio_urls = [
+            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ1.mp3",
+            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ2.mp3",
+            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ3.mp3",
+            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ4.mp3",
+            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ5.mp3",
+            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ6.mp3",
+            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ7.mp3",
+            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ8.mp3"
+        ]
+        
         next_question_audio_url = None
         next_question_text = None
         
-        if (1 <= question_index < 8) and not is_finishing:
+        if (0 <= question_index < 8) and not is_finishing:
             next_question_text = questions[question_index] 
-            next_question_audio_url = await self.generate_tts(user_id, char_id, next_question_text)
+            next_question_audio_url = pregenerated_audio_urls[question_index]
             
         return {
             "user_recognized_text": user_text,
