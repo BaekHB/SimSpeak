@@ -24,7 +24,6 @@ class SimSpeakAIPipeline:
         self.speech_region = os.getenv("AZURE_SPEECH_REGION", "eastus")
         self.storage_connection = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 
-        # [최적화 핵심] 커넥션 풀링 (Connection Pooling)
         self.http_client = httpx.AsyncClient(timeout=15.0)
         
         self.llm_client = AsyncAzureOpenAI(
@@ -68,13 +67,12 @@ class SimSpeakAIPipeline:
                 model="gpt-4o-mini",
                 messages=safe_messages,
                 max_tokens=250,
-                # [핵심 수정] OpenAI가 무조건 완벽한 JSON 형식만 반환하도록 강제 (파싱 에러 원천 차단)
                 response_format={"type": "json_object"} 
             )
             return response.choices[0].message.content
         except Exception as e:
             print(f"[초고속 대사 엔진] 장애 우회 처리: {e}")
-            return '{"detected_invalid_words": [], "text_content": "앗, 미안해! 데이터가 살짝 밀렸나 봐. 다시 말해줄래?", "action_description": "멋쩍게 웃는다.", "affinity_delta": 0, "system_notification": "", "is_active": true}'
+            return '{"detected_invalid_words": [], "text_content": "앗, 미안해! 데이터가 살짝 밀렸나 봐. 다시 말해줄래?", "action_description": "멋쩍게 웃는다.", "affinity_delta": 0, "system_notification": ""}'
     
     def make_ssml(self, character_id: str, text_content: str) -> str:
         char_id = character_id.lower()
@@ -173,19 +171,12 @@ class SimSpeakAIPipeline:
         temp_filename = f"reply_{uuid.uuid4().hex[:8]}.mp3"
         
         try:
-            # ========================================================
-            # 1. 애저 대신 작성자님이 만든 일레븐랩스 매니저 호출!
-            # ========================================================
             from elevenlabs_manager import generate_elevenlabs_audio
             success = await generate_elevenlabs_audio(character_id, text_content, temp_filename)
             
-            # 생성에 실패했으면 빈 문자열 반환
             if not success:
                 return ""
 
-            # ========================================================
-            # 2. 팀원이 짜둔 애저 클라우드(Blob) 업로드 코드는 100% 그대로 유지
-            # ========================================================
             def upload_to_blob():
                 blob_client = self.blob_container.get_blob_client(temp_filename)
                 with open(temp_filename, "rb") as data: 
@@ -199,7 +190,6 @@ class SimSpeakAIPipeline:
             print(f"🎙️ 음성 생성 및 업로드 에러: {e}")
             return ""
         finally:
-            # 3. 로컬 찌꺼기 파일 삭제
             if os.path.exists(temp_filename):
                 try: os.remove(temp_filename)
                 except: pass
@@ -208,7 +198,7 @@ class SimSpeakAIPipeline:
         async with aiofiles.open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: return await f.read()
 
     # =========================================================================
-    # 1차 초고속 대사 처리 (텍스트/음성 모드 완벽 분기 적용 + 티키타카 질문 유도)
+    # 1차 초고속 대사 처리 (GPT 욕설 지능형 필터링 탑재)
     # =========================================================================
     async def run_only_dialogue_track(self, session_db: dict, user_id: int, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: int = 1) -> dict:
         char_id = character_id.lower()
@@ -230,25 +220,32 @@ class SimSpeakAIPipeline:
             "TEXT MESSAGE MODE: You are chatting via text. NO physical contact. Describe independent 3rd-person actions (e.g., looking at phone, drinking coffee, sighing alone)."
         )
 
-        # [티키타카 질문 룰 추가 완료] 대화가 끊기지 않도록 대사 끝에 질문을 달도록 강제
         json_injection_rule = """
         [CRITICAL OUTPUT RULE & FAST TRACK JSON FORMAT]
         IGNORE the [STRICT OUTPUT FORMAT] in your base persona. DO NOT generate 'system_evaluation' or 'corrections'.
         You MUST respond ONLY with a raw, pure JSON object matching this schema.
 
-        [URGENT INSTRUCTION]
-        1. FIRST, analyze the user's text. Extract ONLY Konglish words (e.g., "man-to-man", "notebook" for laptop, "cider" for soda) into "detected_invalid_words". 
-        Do NOT extract pure Korean words (e.g., "진짜", "대박") here. Only extract Konglish. If none, output [].
+        [SAFETY & BOUNDARY RULE - HIGHEST PRIORITY]
+        1. Analyze the user's text for severe profanity, abuse, or threats (e.g., Korean slangs like '씨발', '새끼', '병신', '좆' etc.).
+        2. If severe profanity is detected:
+           - "text_content": MUST be exactly "" (Absolutely empty string).
+           - "action_description": MUST be exactly "" (Absolutely empty string).
+           - "affinity_delta": MUST be 0.
+           - "system_notification": MUST be "[SYSTEM] 부적절한 언어가 감지되었습니다. 올바른 표현으로 다시 입력해 주세요."
+           - "detected_invalid_words": [].
+
+        [NORMAL CONVERSATION RULE - IF NO PROFANITY]
+        1. FIRST, analyze the user's text. Extract ONLY Konglish words (e.g., "man-to-man") into "detected_invalid_words". Do NOT extract pure Korean words. If none, output [].
         2. THEN, generate your character's response.
-        3. [CONVERSATION CONTINUATION]: ALWAYS end your "text_content" with a natural, context-relevant follow-up question. The character MUST ask the user something to keep the conversation flowing.
+        3. ALWAYS end your "text_content" with a natural, context-relevant follow-up question (MUST end with '?').
+        4. "system_notification" is "", and "affinity_delta" is based strictly on your persona rules.
 
         {
           "detected_invalid_words": [],
-          "text_content": "Your verbal response in English. (MUST end with a question mark '?')",
+          "text_content": "Your verbal response in English.",
           "action_description": "Behavioral status in Korean",
-          "affinity_delta": integer (-5 to 5, based strictly on your persona rules),
-          "system_notification": "Warning message if applicable, else empty string",
-          "is_active": boolean (false only if user used severe profanity)
+          "affinity_delta": integer,
+          "system_notification": "String"
         }
         """
         
@@ -266,7 +263,6 @@ class SimSpeakAIPipeline:
         print(f" [ASYNC LLM CALL] User '{user_id}' - Requesting Dialogue 가속엔진 가동...")
         raw_response = await self.generate_lightning_dialogue(messages)
         
-        # [안전성 보강] 마크다운 복사 깨짐 원천 방지용 백틱 결합법 사용
         safe_json_tag = "``" + "`json"
         safe_backticks = "``" + "`"
         clean_json_str = raw_response.replace(safe_json_tag, "").replace(safe_backticks, "").strip()
@@ -281,18 +277,32 @@ class SimSpeakAIPipeline:
                 "detected_invalid_words": [],
                 "text_content": text_match.group(1) if text_match else "Oh, sorry! I got distracted. What were you saying?", 
                 "action_description": action_match.group(1) if action_match else "여유롭게 웃어 보인다.",
-                "affinity_delta": 0, "is_active": True, "system_notification": ""
+                "affinity_delta": 0, "system_notification": ""
             }
 
-        # 통합 감점 로직 계산
+        if ai_result.get("system_notification"):
+            print(f"🚨 [GPT DETECTED PROFANITY] 유저 '{user_id}' 대화 차단 발동")
+            
+            ai_result["text_content"] = ""
+            ai_result["action_description"] = ""
+            ai_result["affinity_delta"] = 0
+            ai_result["system_evaluation"] = {"is_penalty": False}
+            
+            ai_result["audio_url"] = ""
+            ai_result["user_recognized_text"] = user_text
+            ai_result["current_total_affinity"] = user_data["current_affinity"]
+            ai_result["summary_context"] = current_summary
+            ai_result["history_context"] = user_data["history"]
+            ai_result["raw_llm_log"] = {"model": "gpt-4o-mini (Profanity Blocked)"}
+            
+            return ai_result
+
         affinity_delta = ai_result.get("affinity_delta", 0)
         ai_result["system_evaluation"] = {"is_penalty": False}
 
-        # 1. AI가 찾은 콩글리시 검사
         detected_invalid = ai_result.get("detected_invalid_words", [])
         konglish_count = len(detected_invalid) if isinstance(detected_invalid, list) else 0
 
-        # 2. 파이썬 순수 한글 혼용률 검사
         mixed_ratio = 0
         words = user_text.split()
         if words:
@@ -309,14 +319,12 @@ class SimSpeakAIPipeline:
         else:
             threshold = 0.30
 
-        # 3. 합산된 혼용률이 스테이지 임계치(10~30%)를 넘었을 때만 감점
         if mixed_ratio >= threshold:
             affinity_delta = -1
             ai_result["system_evaluation"]["is_penalty"] = True
 
         ai_result["affinity_delta"] = affinity_delta
 
-        # 불필요한 배열 삭제 (DB 저장용 깔끔하게 정리)
         if "detected_invalid_words" in ai_result:
             del ai_result["detected_invalid_words"]
 
@@ -325,7 +333,7 @@ class SimSpeakAIPipeline:
         user_data["current_affinity"] = max(0, min(100, user_data["current_affinity"] + affinity_delta))
 
         main_audio_url = ""
-        if ai_result.get("is_active", True) and ai_result.get("text_content", ""):
+        if ai_result.get("text_content", ""):
             main_audio_url = await self.generate_tts(user_id, char_id, ai_result.get("text_content", ""))
 
         ai_result["audio_url"] = main_audio_url
@@ -357,7 +365,6 @@ class SimSpeakAIPipeline:
         
         [URGENT INSTRUCTION]
         유저가 원래 영어와 다른 뜻으로 쓰는 콩글리시(False Friends)를 악착같이 찾아라!
-        예: "man-to-man" -> 맨투맨 티셔츠, "notebook" -> 노트북 컴퓨터, "cider" -> 탄산음료, "one piece" -> 원피스 치마, "padding" -> 패딩 점퍼 등)
         순수 한국어는 절대 배열에 넣지 말고 오직 콩글리시만 배열에 넣어라.  
         
         [OUTPUT FORMAT] 
@@ -380,10 +387,8 @@ class SimSpeakAIPipeline:
                 self.llm_client, 
                 model="gpt-4o-mini", 
                 messages=[{"role": "system", "content": system_feedback_prompt}, {"role": "user", "content": [{"type": "text", "text": str(user_text)}]}],
-                # 2차 트랙에도 JSON Mode 추가하여 파싱 에러 방지
                 response_format={"type": "json_object"} 
             )
-            # [수정됨] 정규식(Regex) 대신 100% 안전한 기본 replace 함수를 사용하여 복사 에러 원천 차단!
             raw_feedback_content = response.choices[0].message.content
             clean_feedback = raw_feedback_content.replace("```json", "").replace("```", "").strip()
             feedback_json = json.loads(clean_feedback)
@@ -438,30 +443,26 @@ class SimSpeakAIPipeline:
         return {"system_evaluation": feedback_json}
 
     # =========================================================================
-    # 통합 실행 매니저 (main.py의 pipeline.run() 호출 완벽 대응)
+    # 통합 실행 매니저
     # =========================================================================
     async def run(self, session_db: dict, user_id: int, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: int = 1) -> dict:
-        # 1. 1차 초고속 대사 트랙 실행 (Whisper 음성 추출 포함)
         ai_result = await self.run_only_dialogue_track(
             session_db=session_db, user_id=user_id, character_id=character_id,
             user_text=user_text, is_video_call=is_video_call, 
             user_audio_url=user_audio_url, stage_id=stage_id
         )
         
-        # 2. 2차 오답노트 트랙 실행 (1차에서 해독된 텍스트를 넘겨줌)
         recognized_text = ai_result.get("user_recognized_text", user_text)
         eval_result = await self.run_only_evaluation_track(
             user_id=user_id, character_id=character_id, 
             user_text=recognized_text, stage_id=stage_id, user_audio_url=user_audio_url
         )
         
-        # 3. 1차와 2차 결과 완벽 병합
         ai_result.update(eval_result)
-        
         return ai_result
 
     # =========================================================================
-    # ⚡ 3차 레벨 테스트 전용 트랙 (피드백 없이 등급/점수만 깔끔하게 반환)
+    # ⚡ 3차 레벨 테스트 전용 트랙
     # =========================================================================
     async def process_level_test_question(self, user_id: str, character_id: str, question_index: int, user_audio_url: str = None, user_text: str = "", is_finishing: bool = False) -> dict:
         char_id = character_id.lower()
@@ -489,7 +490,6 @@ class SimSpeakAIPipeline:
         next_question_audio_url = None
         next_question_text = None
         
-        # 1~7번 문항이고 현재 종료하는 중이 아니라면, 다음 번호의 질문을 읽어주는 TTS 생성
         if (1 <= question_index < 8) and not is_finishing:
             next_question_text = questions[question_index] 
             next_question_audio_url = await self.generate_tts(user_id, char_id, next_question_text)
@@ -502,7 +502,6 @@ class SimSpeakAIPipeline:
         }
 
     async def evaluate_holistic_cefr_level(self, user_answers: list) -> dict:
-        # 발음 점수 평균 계산
         total_acc, total_flu, valid_audio_count = 0, 0, 0
         for ans in user_answers:
             if ans.get("accuracy") is not None and ans.get("fluency") is not None:
@@ -594,7 +593,6 @@ class SimSpeakAIPipeline:
             clean_str = raw_content.replace("```json", "").replace("```", "").strip()
             parsed_data = json.loads(clean_str)
             
-            # AI의 산술 연산 오류를 방지하기 위해 파이썬에서 직접 5개 지표 평균 계산
             total_sum = (
                 parsed_data.get("fluency_score", 0) +
                 parsed_data.get("expression_score", 0) +
