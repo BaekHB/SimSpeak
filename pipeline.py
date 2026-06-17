@@ -534,9 +534,11 @@ class SimSpeakAIPipeline:
         next_question_audio_url = None
         next_question_text = None
         
-        if (0 <= question_index < 8) and not is_finishing:
-            next_question_text = questions[question_index] 
-            next_question_audio_url = pregenerated_audio_urls[question_index]
+        next_idx = question_index + 1
+        
+        if (0 <= next_idx < 8) and not is_finishing:
+            next_question_text = questions[next_idx] 
+            next_question_audio_url = pregenerated_audio_urls[next_idx]
             
         return {
             "user_recognized_text": user_text,
