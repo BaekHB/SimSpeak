@@ -51,6 +51,8 @@ class ChatLogModel(Base):
     current_affinity = Column(Integer, default=30)       
     summary_context = Column(Text, nullable=True)        
     stage_id = Column(Integer, nullable=True)        
+    # 🚨 [수정 1] DB 모델에 session_id 컬럼 반영 및 기본값 설정
+    session_id = Column(String(100), nullable=False, default="default_session")
     
     if DATABASE_URL.startswith("sqlite"):
         from sqlalchemy import JSON
@@ -107,6 +109,8 @@ class UnifiedChatRequest(BaseModel):
     is_video_call: bool
     user_audio_url: Optional[str] = None  
     stage_id: Optional[int] = 1
+    # 🚨 [수정 2] 요청 데이터 바디 규격에도 session_id 기본값 설정
+    session_id: Optional[str] = "default_session"
 
 class UnifiedLevelTestRequest(BaseModel):
     user_id: int
@@ -119,7 +123,7 @@ class UnifiedLevelTestRequest(BaseModel):
 
 pipeline = SimSpeakAIPipeline()
 
-async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int, user_audio_url: str, dialogue_result: dict):
+async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int, user_audio_url: str, dialogue_result: dict, session_id: str):
     db = SessionLocal()
     try:
         print(f"▶️ [비동기 병렬 피드백 트랙] 스타트 (오답노트 및 정밀 발음 평가 중...)")
@@ -142,17 +146,29 @@ async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int
         print(json.dumps(feedback_payload, ensure_ascii=False, indent=2))
         print(f"==================================================================")
 
+        # 🚨 [수정 3] INSERT 구문 실행 시 session_id 변수를 명확하게 바인딩하여 NotNullViolation 원천 차단
         new_log = ChatLogModel(
-            user_id=user_id, character_id=char_id, user_text=user_recognized_text,
-            user_audio_url=user_audio_url, ai_text_content=dialogue_result.get("text_content", ""),
-            ai_audio_url=dialogue_result.get("audio_url", ""), current_affinity=dialogue_result.get("current_total_affinity", 30), 
-            chat_history_context=dialogue_result.get("history_context", []), raw_llm_log=dialogue_result.get("raw_llm_log", {}),
-            summary_context=dialogue_result.get("summary_context", ""), stage_id=stage_id
+            user_id=user_id, 
+            character_id=char_id, 
+            user_text=user_recognized_text,
+            user_audio_url=user_audio_url if user_audio_url and user_audio_url.strip() else " ", 
+            ai_text_content=dialogue_result.get("text_content", ""),
+            ai_audio_url=dialogue_result.get("audio_url", ""), 
+            current_affinity=dialogue_result.get("current_total_affinity", 30), 
+            chat_history_context=dialogue_result.get("history_context", []), 
+            raw_llm_log=dialogue_result.get("raw_llm_log", {}),
+            summary_context=dialogue_result.get("summary_context", ""), 
+            stage_id=stage_id, 
+            session_id=session_id  # 매개변수로 넘어온 session_id 바인딩
         )
+        
         final_monitoring_data = {
-            "text_content": dialogue_result.get("text_content", ""), "action_description": dialogue_result.get("action_description", ""),
-            "audio_url": dialogue_result.get("audio_url", ""), "user_recognized_text": user_recognized_text,
-            "affinity_delta": dialogue_result.get("affinity_delta", 0), "current_total_affinity": dialogue_result.get("current_total_affinity", 30),
+            "text_content": dialogue_result.get("text_content", ""), 
+            "action_description": dialogue_result.get("action_description", ""),
+            "audio_url": dialogue_result.get("audio_url", ""), 
+            "user_recognized_text": user_recognized_text,
+            "affinity_delta": dialogue_result.get("affinity_delta", 0), 
+            "current_total_affinity": dialogue_result.get("current_total_affinity", 30),
             "system_evaluation": feedback_json
         }
         new_monitoring_log = CharacterChatLogModel(user_id=user_id, character_id=char_id, response_data=final_monitoring_data)
@@ -176,6 +192,8 @@ async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int
 async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session = Depends(get_db)):
     char_id = request.character_id.lower()
     user_id = request.user_id
+    # 들어온 session_id가 없거나 빈 값이면 기본값으로 대체 보정
+    req_session_id = request.session_id if request.session_id else "default_session"
 
     def fetch_last_log():
         return db.query(ChatLogModel).filter(
@@ -185,7 +203,7 @@ async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session =
 
     last_log = await asyncio.to_thread(fetch_last_log)
 
-    history = list(last_log.chat_history_context) if last_log else []
+    history = list(last_log.chat_history_context) if last_log and last_log.chat_history_context else []
     current_affinity = last_log.current_affinity if last_log else 30
     current_summary = last_log.summary_context or "" if last_log else ""
 
@@ -198,10 +216,12 @@ async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session =
             user_audio_url=request.user_audio_url, stage_id=request.stage_id
         )
 
+        # 비동기 백그라운드 태스크로 연산 및 인서트 작업을 넘길 때 확실하게 session_id를 인자로 주입함
         asyncio.create_task(
             background_evaluation_worker(
                 user_id=user_id, char_id=char_id, stage_id=request.stage_id,
-                user_audio_url=request.user_audio_url, dialogue_result=dialogue_result
+                user_audio_url=request.user_audio_url, dialogue_result=dialogue_result,
+                session_id=req_session_id
             )
         )
 
@@ -225,7 +245,7 @@ async def process_level_test_question(request: UnifiedLevelTestRequest, db: Sess
         is_finishing = (request.current_question_index == 8) or request.is_quit
         
         result = await pipeline.process_level_test_question(
-            user_id=request.user_id,
+            user_id=str(request.user_id),
             character_id=request.character_id,
             question_index=request.current_question_index,
             user_audio_url=request.user_audio_url,
