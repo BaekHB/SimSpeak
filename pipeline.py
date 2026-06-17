@@ -252,12 +252,40 @@ class SimSpeakAIPipeline:
         system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Current Mode: {mode_instruction}\n\n{json_injection_rule}"
         messages = [{"role": "system", "content": system_prompt}]
         
+        # 🚨 [추가된 방어막]: DB에서 넘어온 history가 문자열이거나 깨진 리스트일 경우를 완벽히 정제
+        raw_history = user_data.get("history", [])
+        valid_history = []
+        
+        # 만약 DB가 리스트가 아닌 통문자열(String)로 뱉었다면 JSON으로 파싱 시도
+        if isinstance(raw_history, str):
+            try: raw_history = json.loads(raw_history)
+            except: raw_history = []
+            
+        # 리스트 안의 요소가 진짜 딕셔너리({role: ..., content: ...})일 때만 통과
+        if isinstance(raw_history, list):
+            for turn in raw_history:
+                if isinstance(turn, dict) and "role" in turn and "content" in turn:
+                    valid_history.append(turn)
+                elif isinstance(turn, str):
+                    try:
+                        parsed = json.loads(turn)
+                        if isinstance(parsed, dict) and "role" in parsed: valid_history.append(parsed)
+                    except: pass
+                    
+        # 정제된 안전한 리스트로 교체
+        user_data["history"] = valid_history
+        
+        # 안전하게 대화 로그 조립
         for turn in user_data["history"][-6:]:
             try:
                 data = json.loads(turn["content"])
-                messages.append({"role": turn["role"], "content": data.get("text_content", turn["content"])})
+                if isinstance(data, dict):
+                    messages.append({"role": turn["role"], "content": data.get("text_content", str(turn["content"]))})
+                else:
+                    messages.append({"role": turn["role"], "content": str(turn["content"])})
             except Exception:
-                messages.append({"role": turn["role"], "content": turn["content"]})
+                messages.append({"role": turn["role"], "content": str(turn["content"])})
+                
         messages.append({"role": "user", "content": user_text})
 
         print(f" [ASYNC LLM CALL] User '{user_id}' - Requesting Dialogue 가속엔진 가동...")
