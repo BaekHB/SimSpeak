@@ -10,6 +10,69 @@ from openai import AsyncAzureOpenAI
 import azure.cognitiveservices.speech as speechsdk
 from azure.storage.blob import BlobServiceClient
 
+# =========================================================================
+# 🟢 [추가됨] 시나리오 미션 테이블 (DB 변경 없이 메모리에 상수로 선언)
+# =========================================================================
+SCENARIO_MISSION_TABLE = {
+    1: {
+        "situation_prompt": "You are a cafe owner. This is the user's first visit. Greet them and ask for their order.",
+        "keywords": ["i'd like", "can i get"],
+        "min_words": 3,
+        "min_fluency": 80
+    },
+    2: {
+        "situation_prompt": "The user is sitting down and asking you for the Wi-Fi password. Answer kindly.",
+        "keywords": ["what is", "where is"],
+        "check_perfect_sentence": True
+    },
+    3: {
+        "situation_prompt": "The user is hesitating looking at the menu. Ask their preference and recommend a menu.",
+        "keywords": ["i like", "my favorite"],
+        "min_words": 5,
+        "min_accuracy": 85
+    },
+    4: {
+        "situation_prompt": "The cafe is very busy and the drink is late. Apologize and offer a free cookie.",
+        "keywords": ["it's okay", "no problem"],
+        "check_perfect_sentence_count": 2
+    },
+    5: {
+        "situation_prompt": "It's a quiet afternoon. Walk up to the user's table and ask them what they are doing on their laptop.",
+        "grammar_pattern": r"\b(am|is|are)\s+\w+ing\b",
+        "min_words": 6,
+        "check_perfect_sentence_count": 2
+    },
+    6: {
+        "situation_prompt": "The user is making a very complicated custom drink order. Answer playfully and tease them.",
+        "keywords": ["with", "without"],
+        "min_accuracy": 90
+    },
+    7: {
+        "situation_prompt": "It's raining outside. The user looks exhausted. Give them a warm tea not on the menu and listen to their worries.",
+        "keywords": ["because", "i feel"],
+        "min_words": 8,
+        "check_perfect_sentence_count": 3
+    },
+    8: {
+        "situation_prompt": "It's closing time. Take off your apron, walk over, ask if they have an umbrella, and subtly suggest going home together.",
+        "keywords": ["if", "would you"],
+        "min_fluency": 95
+    },
+    9: {
+        "situation_prompt": "It's the weekend. You are meeting the user at a nice restaurant for your first date. Compliment their look.",
+        "keywords": ["you look", "amazing", "beautiful", "handsome"],
+        "min_words": 8,
+        "check_perfect_sentence_count": 3
+    },
+    10: {
+        "situation_prompt": "You are walking along the Han River at night after the date. Confess your true feelings honestly to the user.",
+        "min_words": 10,
+        "min_fluency": 95,
+        "min_accuracy": 95
+    }
+}
+
+
 class SimSpeakAIPipeline:
     def __init__(self):
         self.openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -24,7 +87,6 @@ class SimSpeakAIPipeline:
         self.speech_region = os.getenv("AZURE_SPEECH_REGION", "eastus")
         self.storage_connection = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
         
-        # 🟢 Azure CDN 도메인 주소 환경변수 세팅
         self.cdn_base_url = os.getenv("CDN_BASE_URL", "https://simspeak-audio-amahc0gkatbdc3fv.a02.azurefd.net")
 
         self.http_client = httpx.AsyncClient(timeout=15.0)
@@ -43,6 +105,56 @@ class SimSpeakAIPipeline:
         
         self.blob_service = BlobServiceClient.from_connection_string(self.storage_connection)
         self.blob_container = self.blob_service.get_container_client("audio-files")
+
+    # =========================================================================
+    # 🟢 [추가됨] 미션 검증 매니저 (데이터 구조 변경 없이 판별만 수행)
+    # =========================================================================
+    def verify_scenario_mission(self, stage_id: int, user_text: str, eval_json: dict, pronunciation_eval: dict) -> dict:
+        try:
+            mission = SCENARIO_MISSION_TABLE.get(int(stage_id))
+        except ValueError:
+            mission = None
+
+        if not mission:
+            return {"mission_success": True, "reason": "등록되지 않은 스테이지입니다."}
+
+        user_text_lower = user_text.lower() if user_text else ""
+        word_count = len(user_text.split()) if user_text else 0
+        
+        is_penalty = eval_json.get("is_penalty", False)
+        
+        accuracy_score = pronunciation_eval.get("accuracy", 0) if pronunciation_eval else 0
+        fluency_score = pronunciation_eval.get("fluency", 0) if pronunciation_eval else 0
+
+        checks = {}
+        
+        if "keywords" in mission:
+            checks["keywords"] = any(kw in user_text_lower for kw in mission["keywords"])
+            
+        if "min_words" in mission:
+            checks["min_words"] = word_count >= mission["min_words"]
+            
+        if "min_fluency" in mission:
+            checks["min_fluency"] = fluency_score >= mission["min_fluency"]
+            
+        if "min_accuracy" in mission:
+            checks["min_accuracy"] = accuracy_score >= mission["min_accuracy"]
+            
+        if mission.get("check_perfect_sentence"):
+            checks["perfect_sentence"] = not is_penalty
+
+        if "grammar_pattern" in mission:
+            checks["grammar_pattern"] = bool(re.search(mission["grammar_pattern"], user_text_lower, re.IGNORECASE))
+
+        if "check_perfect_sentence_count" in mission:
+            checks["perfect_sentence_count"] = not is_penalty
+
+        mission_success = all(checks.values()) if checks else True
+        
+        return {
+            "mission_success": mission_success,
+            "detailed_checks": checks
+        }
 
     async def call_llm_with_retry(self, ai_client, **kwargs):
         max_retries = 2
@@ -188,7 +300,6 @@ class SimSpeakAIPipeline:
             
             uploaded_filename = await asyncio.to_thread(upload_to_blob)
             
-            # 🟢 [수정됨] CDN 도메인을 조합하여 최종 다운로드 주소 완성
             final_cdn_url = f"{self.cdn_base_url}/audio-files/{uploaded_filename}"
             return final_cdn_url
             
@@ -204,7 +315,7 @@ class SimSpeakAIPipeline:
         async with aiofiles.open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: return await f.read()
 
     # =========================================================================
-    # 1차 초고속 대사 처리 (GPT 욕설 지능형 필터링 탑재)
+    # 1차 초고속 대사 처리 (GPT 욕설 지능형 필터링 및 스테이지 미션 주입)
     # =========================================================================
     async def run_only_dialogue_track(self, session_db: dict, user_id: int, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: int = 1) -> dict:
         char_id = character_id.lower()
@@ -225,6 +336,15 @@ class SimSpeakAIPipeline:
             if is_video_call else 
             "TEXT MESSAGE MODE: You are chatting via text. NO physical contact. Describe independent 3rd-person actions (e.g., looking at phone, drinking coffee, sighing alone)."
         )
+
+        # 🟢 [수정됨] 미션 상황 프롬프트 동적 주입 로직
+        try:
+            current_mission = SCENARIO_MISSION_TABLE.get(int(stage_id), {})
+        except ValueError:
+            current_mission = {}
+            
+        situation_prompt = current_mission.get("situation_prompt", "")
+        situation_instruction = f"\n[CURRENT SITUATION MISSION]\n{situation_prompt}\n" if situation_prompt else ""
 
         json_injection_rule = """
         [CRITICAL OUTPUT RULE & FAST TRACK JSON FORMAT]
@@ -255,7 +375,8 @@ class SimSpeakAIPipeline:
         }
         """
         
-        system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Current Mode: {mode_instruction}\n\n{json_injection_rule}"
+        # 상황 지침(situation_instruction)이 프롬프트에 병합됨
+        system_prompt = summary_prefix + base_prompt + situation_instruction + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Current Mode: {mode_instruction}\n\n{json_injection_rule}"
         messages = [{"role": "system", "content": system_prompt}]
         
         raw_history = user_data.get("history", [])
@@ -423,7 +544,6 @@ class SimSpeakAIPipeline:
             )
             raw_feedback_content = response.choices[0].message.content
             
-            # 🚨 [수정 완료]: 여기서 터졌던 구문 에러를 완벽하게 고쳤습니다.
             clean_feedback = raw_feedback_content.replace("```json", "").replace("```", "").strip()
             
             feedback_json = json.loads(clean_feedback)
@@ -475,6 +595,15 @@ class SimSpeakAIPipeline:
             else:
                 feedback_json["pronunciation_feedback"] = "오디오 데이터 인식이 실패하여 정밀 발음 평가를 수립할 수 없습니다."
 
+        # 🟢 [추가됨] JSON 묶음에 미션 리포트 슬쩍 끼워넣기 (입출력 구조 파괴 없음)
+        mission_report = self.verify_scenario_mission(
+            stage_id=stage_id, 
+            user_text=user_text, 
+            eval_json=feedback_json, 
+            pronunciation_eval=real_pronunciation_evaluations
+        )
+        feedback_json["mission_report"] = mission_report
+
         return {"system_evaluation": feedback_json}
 
     # =========================================================================
@@ -522,7 +651,6 @@ class SimSpeakAIPipeline:
             "Some say first impressions decide everything in romance. Do you agree? Share your thoughts."
         ]
         
-        # 🟢 [수정됨] 하드코딩된 원본 스토리지를 cdn_base_url 환경변수를 사용하여 교체
         pregenerated_audio_urls = [
             f"{self.cdn_base_url}/audio-files/leveltestQ1.mp3",
             f"{self.cdn_base_url}/audio-files/leveltestQ2.mp3",
