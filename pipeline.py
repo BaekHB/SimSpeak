@@ -24,7 +24,7 @@ class SimSpeakAIPipeline:
         self.speech_region = os.getenv("AZURE_SPEECH_REGION", "eastus")
         self.storage_connection = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
         
-        # 🟢 [수정됨] Azure CDN 도메인 주소 환경변수 추가 (기본값 설정)
+        # 🟢 Azure CDN 도메인 주소 환경변수 세팅
         self.cdn_base_url = os.getenv("CDN_BASE_URL", "https://simspeak-audio-amahc0gkatbdc3fv.a02.azurefd.net")
 
         self.http_client = httpx.AsyncClient(timeout=15.0)
@@ -184,7 +184,7 @@ class SimSpeakAIPipeline:
                 blob_client = self.blob_container.get_blob_client(temp_filename)
                 with open(temp_filename, "rb") as data: 
                     blob_client.upload_blob(data, overwrite=True)
-                return temp_filename # 🟢 [수정됨] URL 전체가 아닌 파일명만 리턴
+                return temp_filename
             
             uploaded_filename = await asyncio.to_thread(upload_to_blob)
             
@@ -292,9 +292,7 @@ class SimSpeakAIPipeline:
         print(f" [ASYNC LLM CALL] User '{user_id}' - Requesting Dialogue 가속엔진 가동...")
         raw_response = await self.generate_lightning_dialogue(messages)
         
-        safe_json_tag = "``" + "`json"
-        safe_backticks = "``" + "`"
-        clean_json_str = raw_response.replace(safe_json_tag, "").replace(safe_backticks, "").strip()
+        clean_json_str = raw_response.replace("```json", "").replace("```", "").strip()
         
         try:
             ai_result = json.loads(clean_json_str)
@@ -424,8 +422,10 @@ class SimSpeakAIPipeline:
                 response_format={"type": "json_object"} 
             )
             raw_feedback_content = response.choices[0].message.content
-            clean_feedback = raw_feedback_content.replace("```json", "").replace("
-```", "").strip()
+            
+            # 🚨 [수정 완료]: 여기서 터졌던 구문 에러를 완벽하게 고쳤습니다.
+            clean_feedback = raw_feedback_content.replace("```json", "").replace("```", "").strip()
+            
             feedback_json = json.loads(clean_feedback)
         except Exception:
             feedback_json = {"is_penalty": False, "grammar_feedback": "시스템 분석 지연으로 실시간 문법 교정이 불가능합니다.", "corrections_json": [], "ipa_guides": {}}
@@ -639,7 +639,9 @@ class SimSpeakAIPipeline:
                 response_format={"type": "json_object"} 
             )
             raw_content = response.choices[0].message.content
+            
             clean_str = raw_content.replace("```json", "").replace("```", "").strip()
+            
             parsed_data = json.loads(clean_str)
             
             total_sum = (
