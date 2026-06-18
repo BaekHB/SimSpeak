@@ -23,6 +23,9 @@ class SimSpeakAIPipeline:
         self.speech_key = os.getenv("AZURE_SPEECH_KEY")
         self.speech_region = os.getenv("AZURE_SPEECH_REGION", "eastus")
         self.storage_connection = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+        
+        # 🟢 [수정됨] Azure CDN 도메인 주소 환경변수 추가 (기본값 설정)
+        self.cdn_base_url = os.getenv("CDN_BASE_URL", "https://simspeak-audio-amahc0gkatbdc3fv.a02.azurefd.net")
 
         self.http_client = httpx.AsyncClient(timeout=15.0)
         
@@ -181,10 +184,13 @@ class SimSpeakAIPipeline:
                 blob_client = self.blob_container.get_blob_client(temp_filename)
                 with open(temp_filename, "rb") as data: 
                     blob_client.upload_blob(data, overwrite=True)
-                return blob_client.url
+                return temp_filename # 🟢 [수정됨] URL 전체가 아닌 파일명만 리턴
             
-            blob_url = await asyncio.to_thread(upload_to_blob)
-            return blob_url
+            uploaded_filename = await asyncio.to_thread(upload_to_blob)
+            
+            # 🟢 [수정됨] CDN 도메인을 조합하여 최종 다운로드 주소 완성
+            final_cdn_url = f"{self.cdn_base_url}/audio-files/{uploaded_filename}"
+            return final_cdn_url
             
         except Exception as e:
             print(f"🎙️ 음성 생성 및 업로드 에러: {e}")
@@ -252,16 +258,13 @@ class SimSpeakAIPipeline:
         system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Current Mode: {mode_instruction}\n\n{json_injection_rule}"
         messages = [{"role": "system", "content": system_prompt}]
         
-        # 🚨 [추가된 방어막]: DB에서 넘어온 history가 문자열이거나 깨진 리스트일 경우를 완벽히 정제
         raw_history = user_data.get("history", [])
         valid_history = []
         
-        # 만약 DB가 리스트가 아닌 통문자열(String)로 뱉었다면 JSON으로 파싱 시도
         if isinstance(raw_history, str):
             try: raw_history = json.loads(raw_history)
             except: raw_history = []
             
-        # 리스트 안의 요소가 진짜 딕셔너리({role: ..., content: ...})일 때만 통과
         if isinstance(raw_history, list):
             for turn in raw_history:
                 if isinstance(turn, dict) and "role" in turn and "content" in turn:
@@ -272,10 +275,8 @@ class SimSpeakAIPipeline:
                         if isinstance(parsed, dict) and "role" in parsed: valid_history.append(parsed)
                     except: pass
                     
-        # 정제된 안전한 리스트로 교체
         user_data["history"] = valid_history
         
-        # 안전하게 대화 로그 조립
         for turn in user_data["history"][-6:]:
             try:
                 data = json.loads(turn["content"])
@@ -327,7 +328,7 @@ class SimSpeakAIPipeline:
 
         try:
             affinity_delta = int(ai_result.get("affinity_delta", 0))
-            affinity_delta = max(-1, min(1, affinity_delta)) # 파이썬 단에서도 강제로 -1 ~ +1 사이로 묶음
+            affinity_delta = max(-1, min(1, affinity_delta)) 
         except Exception:
             affinity_delta = 0
             
@@ -423,7 +424,8 @@ class SimSpeakAIPipeline:
                 response_format={"type": "json_object"} 
             )
             raw_feedback_content = response.choices[0].message.content
-            clean_feedback = raw_feedback_content.replace("```json", "").replace("```", "").strip()
+            clean_feedback = raw_feedback_content.replace("```json", "").replace("
+```", "").strip()
             feedback_json = json.loads(clean_feedback)
         except Exception:
             feedback_json = {"is_penalty": False, "grammar_feedback": "시스템 분석 지연으로 실시간 문법 교정이 불가능합니다.", "corrections_json": [], "ipa_guides": {}}
@@ -520,15 +522,16 @@ class SimSpeakAIPipeline:
             "Some say first impressions decide everything in romance. Do you agree? Share your thoughts."
         ]
         
+        # 🟢 [수정됨] 하드코딩된 원본 스토리지를 cdn_base_url 환경변수를 사용하여 교체
         pregenerated_audio_urls = [
-            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ1.mp3",
-            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ2.mp3",
-            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ3.mp3",
-            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ4.mp3",
-            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ5.mp3",
-            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ6.mp3",
-            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ7.mp3",
-            "https://9aifinalteam4.blob.core.windows.net/audio-files/leveltestQ8.mp3"
+            f"{self.cdn_base_url}/audio-files/leveltestQ1.mp3",
+            f"{self.cdn_base_url}/audio-files/leveltestQ2.mp3",
+            f"{self.cdn_base_url}/audio-files/leveltestQ3.mp3",
+            f"{self.cdn_base_url}/audio-files/leveltestQ4.mp3",
+            f"{self.cdn_base_url}/audio-files/leveltestQ5.mp3",
+            f"{self.cdn_base_url}/audio-files/leveltestQ6.mp3",
+            f"{self.cdn_base_url}/audio-files/leveltestQ7.mp3",
+            f"{self.cdn_base_url}/audio-files/leveltestQ8.mp3"
         ]
         
         next_question_audio_url = None
