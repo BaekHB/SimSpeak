@@ -261,12 +261,18 @@ async def process_level_test_question(request: UnifiedLevelTestRequest, db: Sess
                 fluency = result["pronunciation_evaluations"].get("fluency")
                 
             if request.accumulated_answers is not None:
-                request.accumulated_answers.append({
-                    "question_index": request.current_question_index,
-                    "text": result.get("user_recognized_text", ""),
-                    "accuracy": accuracy,
-                    "fluency": fluency
-                })
+                # 마지막 문항이 이미 accumulated_answers에 포함되어 있는지 확인 후 중복 방지
+                already_included = any(
+                    ans.get("question_index") == request.current_question_index
+                    for ans in request.accumulated_answers
+                )
+                if not already_included:
+                    request.accumulated_answers.append({
+                        "question_index": request.current_question_index,
+                        "text": result.get("user_recognized_text", ""),
+                        "accuracy": accuracy,
+                        "fluency": fluency
+                    })
                 
             print(f"▶️ [레벨 테스트 종합 평가] 스타트 ({len(request.accumulated_answers)}개의 문항 분석 중...)")
             final_result = await pipeline.evaluate_holistic_cefr_level(request.accumulated_answers)
