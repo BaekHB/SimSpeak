@@ -10,3 +10,4 @@ python-dotenv
 aiofiles
 python-multipart
 certifi
+httpx
