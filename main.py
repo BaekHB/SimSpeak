@@ -13,6 +13,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
+import httpx
+
 from pipeline import SimSpeakAIPipeline
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -111,6 +113,7 @@ class UnifiedChatRequest(BaseModel):
     stage_id: Optional[int] = 1
     # 🚨 [수정 2] 요청 데이터 바디 규격에도 session_id 기본값 설정
     session_id: Optional[str] = "default_session"
+    chat_log_id: Optional[int] = None  # 자바 백엔드에서 전달하는 고유 식별자
 
 class UnifiedLevelTestRequest(BaseModel):
     user_id: int
@@ -123,7 +126,9 @@ class UnifiedLevelTestRequest(BaseModel):
 
 pipeline = SimSpeakAIPipeline()
 
-async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int, user_audio_url: str, dialogue_result: dict, session_id: str):
+JAVA_BACKEND_URL = os.getenv("JAVA_BACKEND_URL", "http://localhost:8080")
+
+async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int, user_audio_url: str, dialogue_result: dict, session_id: str, chat_log_id: int = None):
     db = SessionLocal()
     try:
         print(f"▶️ [비동기 병렬 피드백 트랙] 스타트 (오답노트 및 정밀 발음 평가 중...)")
@@ -181,6 +186,31 @@ async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int
         await asyncio.to_thread(save_to_db)
         print(f"🎉 [Neon DB] 대사방 로그 + 오답노트 정산본 한 통으로 합치기 최종 성공!")
 
+        # ── Webhook 콜백: 자바 백엔드로 system_evaluation 전송 ──
+        if chat_log_id is not None:
+            corrections = feedback_json.get("corrections_json", [])
+            if isinstance(corrections, str):
+                try:
+                    corrections = json.loads(corrections)
+                except Exception:
+                    corrections = []
+
+            callback_payload = {
+                "chat_log_id": chat_log_id,
+                "system_evaluation": {
+                    "grammar_feedback": feedback_json.get("grammar_feedback", ""),
+                    "detected_invalid_words": feedback_json.get("detected_invalid_words", ""),
+                    "corrections_json": corrections
+                }
+            }
+            callback_url = f"{JAVA_BACKEND_URL}/api/chat/callback"
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(callback_url, json=callback_payload, timeout=10.0)
+                print(f"📡 [Webhook 콜백] 전송 완료 → {callback_url} | status: {resp.status_code} | chat_log_id: {chat_log_id}")
+            except Exception as webhook_err:
+                print(f"❌ [Webhook 콜백 실패]: {webhook_err}")
+
     except Exception as bg_err:
         db.rollback()
         print(f"❌ [백그라운드 피드백 에러 발생]: {bg_err}")
@@ -221,7 +251,7 @@ async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session =
             background_evaluation_worker(
                 user_id=user_id, char_id=char_id, stage_id=request.stage_id,
                 user_audio_url=request.user_audio_url, dialogue_result=dialogue_result,
-                session_id=req_session_id
+                session_id=req_session_id, chat_log_id=request.chat_log_id
             )
         )
 
@@ -261,18 +291,32 @@ async def process_level_test_question(request: UnifiedLevelTestRequest, db: Sess
                 fluency = result["pronunciation_evaluations"].get("fluency")
                 
             if request.accumulated_answers is not None:
-                # 마지막 문항이 이미 accumulated_answers에 포함되어 있는지 확인 후 중복 방지
+                # 문자열 배열로 오는 경우 객체 배열로 변환
+                normalized = []
+                for i, ans in enumerate(request.accumulated_answers):
+                    if isinstance(ans, str):
+                        normalized.append({
+                            "question_index": i + 1,
+                            "text": ans,
+                            "accuracy": None,
+                            "fluency": None
+                        })
+                    elif isinstance(ans, dict):
+                        normalized.append(ans)
+
+                # 마지막 문항 중복 방지
                 already_included = any(
-                    ans.get("question_index") == request.current_question_index
-                    for ans in request.accumulated_answers
+                    a.get("question_index") == request.current_question_index
+                    for a in normalized
                 )
                 if not already_included:
-                    request.accumulated_answers.append({
+                    normalized.append({
                         "question_index": request.current_question_index,
                         "text": result.get("user_recognized_text", ""),
                         "accuracy": accuracy,
                         "fluency": fluency
                     })
+                request.accumulated_answers = normalized
                 
             print(f"▶️ [레벨 테스트 종합 평가] 스타트 ({len(request.accumulated_answers)}개의 문항 분석 중...)")
             final_result = await pipeline.evaluate_holistic_cefr_level(request.accumulated_answers)
@@ -300,4 +344,7 @@ async def process_level_test_question(request: UnifiedLevelTestRequest, db: Sess
             
         return result
     except Exception as e:
+        import traceback
+        print(f"❌ [레벨 테스트 500 에러] {type(e).__name__}: {e}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
