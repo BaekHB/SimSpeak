@@ -199,7 +199,7 @@ async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int
                 "chat_log_id": chat_log_id,
                 "system_evaluation": {
                     "grammar_feedback": feedback_json.get("grammar_feedback", ""),
-                    "detected_invalid_words": feedback_json.get("detected_invalid_words", ""),
+                    "detected_invalid_words": ", ".join(feedback_json.get("detected_invalid_words", [])) if isinstance(feedback_json.get("detected_invalid_words"), list) else feedback_json.get("detected_invalid_words", ""),
                     "corrections_json": corrections
                 }
             }
@@ -217,6 +217,10 @@ async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int
     finally:
         db.close()
 
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 @app.post("/api/v1/chat/message")
 async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session = Depends(get_db)):
