@@ -179,7 +179,7 @@ class SimSpeakAIPipeline:
         try:
             response = await self.call_llm_with_retry(
                 self.llm_client,
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=safe_messages,
                 max_tokens=250,
                 response_format={"type": "json_object"} 
