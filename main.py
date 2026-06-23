@@ -126,6 +126,9 @@ class UnifiedLevelTestRequest(BaseModel):
 
 pipeline = SimSpeakAIPipeline()
 
+# 유저별 레벨테스트 발음 점수 캐시 { user_id: { question_index: {accuracy, fluency} } }
+level_test_pronunciation_cache: dict = {}
+
 JAVA_BACKEND_URL = os.getenv("JAVA_BACKEND_URL", "http://localhost:8080")
 
 async def background_evaluation_worker(user_id: int, char_id: str, stage_id: int, user_audio_url: str, dialogue_result: dict, session_id: str, chat_log_id: int = None):
@@ -287,28 +290,41 @@ async def process_level_test_question(request: UnifiedLevelTestRequest, db: Sess
             is_finishing=is_finishing
         )
         
+        # 매 문항마다 발음 점수 캐시에 저장
+        user_cache_key = str(request.user_id)
+        if user_cache_key not in level_test_pronunciation_cache:
+            level_test_pronunciation_cache[user_cache_key] = {}
+        if result.get("pronunciation_evaluations"):
+            level_test_pronunciation_cache[user_cache_key][request.current_question_index] = {
+                "accuracy": result["pronunciation_evaluations"].get("accuracy"),
+                "fluency": result["pronunciation_evaluations"].get("fluency")
+            }
+
         if is_finishing:
-            accuracy = None
-            fluency = None
-            if result.get("pronunciation_evaluations"):
-                accuracy = result["pronunciation_evaluations"].get("accuracy")
-                fluency = result["pronunciation_evaluations"].get("fluency")
-                
             if request.accumulated_answers is not None:
-                # 문자열 배열로 오는 경우 객체 배열로 변환
+                # 문자열 배열로 오는 경우 객체 배열로 변환 + 캐시에서 발음 점수 복원
+                cached_scores = level_test_pronunciation_cache.get(user_cache_key, {})
                 normalized = []
                 for i, ans in enumerate(request.accumulated_answers):
+                    q_idx = i + 1
+                    cached = cached_scores.get(q_idx, {})
                     if isinstance(ans, str):
                         normalized.append({
-                            "question_index": i + 1,
+                            "question_index": q_idx,
                             "text": ans,
-                            "accuracy": None,
-                            "fluency": None
+                            "accuracy": cached.get("accuracy"),
+                            "fluency": cached.get("fluency")
                         })
                     elif isinstance(ans, dict):
+                        # dict인 경우에도 발음 점수가 None이면 캐시에서 보완
+                        if ans.get("accuracy") is None and cached.get("accuracy") is not None:
+                            ans["accuracy"] = cached.get("accuracy")
+                        if ans.get("fluency") is None and cached.get("fluency") is not None:
+                            ans["fluency"] = cached.get("fluency")
                         normalized.append(ans)
 
                 # 마지막 문항 중복 방지
+                cached_last = cached_scores.get(request.current_question_index, {})
                 already_included = any(
                     a.get("question_index") == request.current_question_index
                     for a in normalized
@@ -317,10 +333,13 @@ async def process_level_test_question(request: UnifiedLevelTestRequest, db: Sess
                     normalized.append({
                         "question_index": request.current_question_index,
                         "text": result.get("user_recognized_text", ""),
-                        "accuracy": accuracy,
-                        "fluency": fluency
+                        "accuracy": cached_last.get("accuracy"),
+                        "fluency": cached_last.get("fluency")
                     })
                 request.accumulated_answers = normalized
+
+                # 캐시 정리
+                level_test_pronunciation_cache.pop(user_cache_key, None)
                 
             print(f"▶️ [레벨 테스트 종합 평가] 스타트 ({len(request.accumulated_answers)}개의 문항 분석 중...)")
             final_result = await pipeline.evaluate_holistic_cefr_level(request.accumulated_answers)
